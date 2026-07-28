@@ -1,0 +1,137 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+.direnv/
+.pypirc
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+.erlang.cookie
+
+# Python bytecode and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+virtualenv/
+__pypackages__/
+
+# Packaging and build output
+build/
+dist/
+sdist/
+wheels/
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+MANIFEST
+pip-wheel-metadata/
+
+# Poetry local configuration
+.poetry/
+poetry.toml
+
+# Test, coverage and benchmark output
+.pytest_cache/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+junit.xml
+junit-*.xml
+test-results/
+reports/
+.benchmarks/
+.mutmut-cache/
+mutants/
+
+# Linters, type checkers and analyzers
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.pyright/
+.dmypy.json
+dmypy.json
+cython_debug/
+
+# Documentation builds
+site/
+docs/_build/
+
+# Logs, profiles and runtime files
+*.log
+logs/
+*.pid
+*.pid.lock
+*.prof
+*.lprof
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+.cache/
+.tmp/
+.local/
+
+# Local Docker, PostgreSQL and RabbitMQ data
+/.docker-data/
+/.volumes/
+/postgres-data/
+/rabbitmq-data/
+*.dump
+*.backup
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs and editors
+.idea/
+.vscode/
+.fleet/
+.vs/
+*.code-workspace
+.project
+.pydevproject
+*.swp
+*.swo
+*~
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary and merge files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+~$*
+
+# Local GitHub Actions runner
+.act/
+
+# Intentionally tracked: poetry.lock, Alembic migrations, Compose files,
+# CI configuration and environment examples.

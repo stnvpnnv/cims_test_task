@@ -30,6 +30,23 @@ pytest-asyncio = ">=1.4.0,<2.0.0"
 pytest-cov = ">=7.1.0,<8.0.0"
 ruff = ">=0.15.22,<0.16.0"
 
+[tool.alembic]
+script_location = "%(here)s/migrations"
+prepend_sys_path = ["%(here)s/src"]
+output_encoding = "utf-8"
+
+[[tool.alembic.post_write_hooks]]
+name = "ruff-check"
+type = "module"
+module = "ruff"
+options = "check --fix REVISION_SCRIPT_FILENAME"
+
+[[tool.alembic.post_write_hooks]]
+name = "ruff-format"
+type = "module"
+module = "ruff"
+options = "format REVISION_SCRIPT_FILENAME"
+
 [tool.ruff]
 line-length = 100
 src = ["src"]

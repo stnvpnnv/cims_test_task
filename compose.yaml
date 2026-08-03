@@ -1,0 +1,49 @@
+services:
+  postgres:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: ${CIMS_POSTGRES_DB:-cims}
+      POSTGRES_USER: ${CIMS_POSTGRES_USER:-cims}
+      POSTGRES_PASSWORD: ${CIMS_POSTGRES_PASSWORD:?Set CIMS_POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${CIMS_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready --quiet --host=127.0.0.1
+          --username="$${POSTGRES_USER}" --dbname="$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  rabbitmq:
+    image: rabbitmq:4.3.4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_NODENAME: rabbit@rabbitmq
+      RABBITMQ_DEFAULT_USER: ${CIMS_RABBITMQ_USER:-cims}
+      RABBITMQ_DEFAULT_PASS: ${CIMS_RABBITMQ_PASSWORD:?Set CIMS_RABBITMQ_PASSWORD in .env}
+      RABBITMQ_DEFAULT_VHOST: ${CIMS_RABBITMQ_VHOST:-cims}
+    ports:
+      - "127.0.0.1:${CIMS_RABBITMQ_AMQP_PORT:-5672}:5672"
+      - "127.0.0.1:${CIMS_RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

@@ -5,22 +5,27 @@ from pydantic import SecretStr, ValidationError
 
 from cims_task_service.config import Settings
 
-_DATABASE_ENVIRONMENT_VARIABLES = (
+_SETTINGS_ENVIRONMENT_VARIABLES = (
+    "CIMS_DEBUG",
     "CIMS_DATABASE_URL",
     "CIMS_DATABASE_POOL_SIZE",
     "CIMS_DATABASE_MAX_OVERFLOW",
     "CIMS_DATABASE_POOL_TIMEOUT_SECONDS",
     "CIMS_DATABASE_POOL_RECYCLE_SECONDS",
+    "CIMS_RABBITMQ_URL",
 )
 
 
-def test_database_settings_have_safe_local_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Defaults are usable locally without embedding a password."""
+@pytest.fixture(autouse=True)
+def clear_settings_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep configuration tests independent from the developer environment."""
 
-    for variable_name in _DATABASE_ENVIRONMENT_VARIABLES:
+    for variable_name in _SETTINGS_ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(variable_name, raising=False)
+
+
+def test_settings_have_safe_non_secret_defaults() -> None:
+    """Defaults describe local services without embedding passwords."""
 
     settings = Settings()
 
@@ -31,9 +36,10 @@ def test_database_settings_have_safe_local_defaults(
     assert settings.database_max_overflow == 10
     assert settings.database_pool_timeout_seconds == 30.0
     assert settings.database_pool_recycle_seconds == 1800
+    assert settings.rabbitmq_url.get_secret_value() == ("amqp://cims@localhost:5672/cims")
 
 
-def test_database_settings_load_environment_overrides(
+def test_settings_load_environment_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Deployment values are read through the project-specific prefix."""
@@ -46,6 +52,10 @@ def test_database_settings_load_environment_overrides(
     monkeypatch.setenv("CIMS_DATABASE_MAX_OVERFLOW", "3")
     monkeypatch.setenv("CIMS_DATABASE_POOL_TIMEOUT_SECONDS", "11.5")
     monkeypatch.setenv("CIMS_DATABASE_POOL_RECYCLE_SECONDS", "600")
+    monkeypatch.setenv(
+        "CIMS_RABBITMQ_URL",
+        "amqp://service:rabbit-secret@rabbitmq:5672/tasks",
+    )
 
     settings = Settings()
 
@@ -56,6 +66,39 @@ def test_database_settings_load_environment_overrides(
     assert settings.database_max_overflow == 3
     assert settings.database_pool_timeout_seconds == 11.5
     assert settings.database_pool_recycle_seconds == 600
+    assert settings.rabbitmq_url.get_secret_value() == (
+        "amqp://service:rabbit-secret@rabbitmq:5672/tasks"
+    )
+
+
+def test_rabbitmq_settings_accept_tls_and_encoded_vhost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TLS URLs and percent-encoded virtual hosts remain valid inputs."""
+
+    rabbitmq_url = "amqps://service:rabbit-secret@rabbitmq/%2Ftenant"
+    monkeypatch.setenv("CIMS_RABBITMQ_URL", rabbitmq_url)
+
+    settings = Settings()
+
+    assert settings.rabbitmq_url.get_secret_value() == rabbitmq_url
+
+
+def test_rabbitmq_settings_store_the_normalized_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime client receives the same canonical URL that was validated."""
+
+    monkeypatch.setenv(
+        "CIMS_RABBITMQ_URL",
+        "amqp://service:rabbit-secret@rabbitmq/tasks ",
+    )
+
+    settings = Settings()
+
+    assert settings.rabbitmq_url.get_secret_value() == (
+        "amqp://service:rabbit-secret@rabbitmq/tasks"
+    )
 
 
 def test_database_settings_reject_non_asyncpg_driver(
@@ -108,15 +151,49 @@ def test_database_settings_require_host_and_database(
         Settings()
 
 
-def test_database_url_is_hidden_from_settings_representation() -> None:
-    """Credentials cannot leak through routine settings logging."""
+def test_connection_urls_are_hidden_from_settings_representation() -> None:
+    """Database and broker credentials cannot leak through settings logging."""
 
     settings = Settings(
-        database_url=SecretStr("postgresql+asyncpg://service:do-not-log@postgres:5432/tasks")
+        database_url=SecretStr(
+            "postgresql+asyncpg://service:database-do-not-log@postgres:5432/tasks"
+        ),
+        rabbitmq_url=SecretStr("amqp://service:rabbitmq-do-not-log@rabbitmq:5672/tasks"),
     )
 
-    assert "do-not-log" not in repr(settings)
+    assert "database-do-not-log" not in repr(settings)
+    assert "rabbitmq-do-not-log" not in repr(settings)
     assert "**********" in repr(settings)
+
+
+@pytest.mark.parametrize(
+    "rabbitmq_url",
+    [
+        "http://rabbitmq/cims",
+        "://",
+        "amqp:///cims",
+        "amqp://rabbitmq:not-a-port/cims",
+    ],
+)
+def test_rabbitmq_settings_reject_invalid_urls_without_leaking_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    rabbitmq_url: str,
+) -> None:
+    """Invalid broker URLs fail safely before a connection is attempted."""
+
+    sentinel = "rabbit-secret"
+    monkeypatch.setenv(
+        "CIMS_RABBITMQ_URL",
+        rabbitmq_url.replace("rabbitmq", f"service:{sentinel}@rabbitmq"),
+    )
+
+    with pytest.raises(
+        ValidationError,
+        match="RabbitMQ URL must be a valid amqp or amqps URL with a host",
+    ) as error_info:
+        Settings()
+
+    assert sentinel not in str(error_info.value)
 
 
 @pytest.mark.parametrize(

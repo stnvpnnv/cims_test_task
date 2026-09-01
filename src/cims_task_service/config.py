@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     database_pool_timeout_seconds: PositiveFloat = 30.0
     database_pool_recycle_seconds: PositiveInt = 1800
     rabbitmq_url: SecretStr = SecretStr("amqp://cims@localhost:5672/cims")
+    rabbitmq_connection_timeout_seconds: PositiveFloat = 10.0
+    rabbitmq_reconnect_interval_seconds: PositiveFloat = 5.0
 
     @field_validator("database_url")
     @classmethod

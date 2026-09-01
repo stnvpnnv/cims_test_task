@@ -13,6 +13,8 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_DATABASE_POOL_TIMEOUT_SECONDS",
     "CIMS_DATABASE_POOL_RECYCLE_SECONDS",
     "CIMS_RABBITMQ_URL",
+    "CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS",
+    "CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS",
 )
 
 
@@ -37,6 +39,8 @@ def test_settings_have_safe_non_secret_defaults() -> None:
     assert settings.database_pool_timeout_seconds == 30.0
     assert settings.database_pool_recycle_seconds == 1800
     assert settings.rabbitmq_url.get_secret_value() == ("amqp://cims@localhost:5672/cims")
+    assert settings.rabbitmq_connection_timeout_seconds == 10.0
+    assert settings.rabbitmq_reconnect_interval_seconds == 5.0
 
 
 def test_settings_load_environment_overrides(
@@ -56,6 +60,8 @@ def test_settings_load_environment_overrides(
         "CIMS_RABBITMQ_URL",
         "amqp://service:rabbit-secret@rabbitmq:5672/tasks",
     )
+    monkeypatch.setenv("CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS", "2.5")
 
     settings = Settings()
 
@@ -69,6 +75,8 @@ def test_settings_load_environment_overrides(
     assert settings.rabbitmq_url.get_secret_value() == (
         "amqp://service:rabbit-secret@rabbitmq:5672/tasks"
     )
+    assert settings.rabbitmq_connection_timeout_seconds == 12.5
+    assert settings.rabbitmq_reconnect_interval_seconds == 2.5
 
 
 def test_rabbitmq_settings_accept_tls_and_encoded_vhost(
@@ -203,14 +211,18 @@ def test_rabbitmq_settings_reject_invalid_urls_without_leaking_credentials(
         ("CIMS_DATABASE_MAX_OVERFLOW", "-1"),
         ("CIMS_DATABASE_POOL_TIMEOUT_SECONDS", "0"),
         ("CIMS_DATABASE_POOL_RECYCLE_SECONDS", "0"),
+        ("CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS", "0"),
+        ("CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS", "-0.1"),
+        ("CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS", "0"),
+        ("CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS", "-0.1"),
     ],
 )
-def test_database_settings_reject_invalid_pool_values(
+def test_settings_reject_invalid_operational_values(
     monkeypatch: pytest.MonkeyPatch,
     variable_name: str,
     invalid_value: str,
 ) -> None:
-    """Invalid pool bounds fail during startup rather than under load."""
+    """Invalid operational bounds fail during startup rather than under load."""
 
     monkeypatch.setenv(variable_name, invalid_value)
 

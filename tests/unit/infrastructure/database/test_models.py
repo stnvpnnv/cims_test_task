@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, Enum, Index, Table, Uuid
+from sqlalchemy import CheckConstraint, Enum, Index, LargeBinary, Table, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.orm import configure_mappers
@@ -51,6 +51,8 @@ def test_task_columns_cover_contract_and_concurrency_state() -> None:
         "priority",
         "status",
         "created_at",
+        "idempotency_key_hash",
+        "request_fingerprint",
         "started_at",
         "finished_at",
         "result",
@@ -80,6 +82,12 @@ def test_task_columns_cover_contract_and_concurrency_state() -> None:
     assert cast(Uuid[UUID], table.c.id.type).as_uuid is True
     assert cast(JSONB, table.c.result.type).none_as_null is True
     assert cast(JSONB, table.c.error.type).none_as_null is True
+    assert cast(LargeBinary, table.c.idempotency_key_hash.type).length == 32
+    assert cast(LargeBinary, table.c.request_fingerprint.type).length == 32
+    assert table.c.idempotency_key_hash.nullable is True
+    assert table.c.request_fingerprint.nullable is True
+    assert table.c.idempotency_key_hash.server_default is None
+    assert table.c.request_fingerprint.server_default is None
     assert table.c.status.server_default is not None
     assert table.c.created_at.server_default is not None
     assert table.c.max_attempts.server_default is None
@@ -95,6 +103,8 @@ def test_task_constraints_have_stable_names() -> None:
         "ck_tasks_attempts",
         "ck_tasks_error_object",
         "ck_tasks_finished_status",
+        "ck_tasks_idempotency_hash_lengths",
+        "ck_tasks_idempotency_pair",
         "ck_tasks_name_nonblank",
         "ck_tasks_result_error_status",
         "ck_tasks_result_object",
@@ -106,6 +116,23 @@ def test_task_constraints_have_stable_names() -> None:
     }
 
 
+def test_task_idempotency_constraints_require_paired_sha256_hashes() -> None:
+    """Optional idempotency metadata is paired and fixed to SHA-256 digest size."""
+
+    table = cast(Table, TaskModel.__table__)
+    constraints = {
+        str(constraint.name): constraint
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint) and constraint.name is not None
+    }
+
+    pair_sql = " ".join(str(constraints["ck_tasks_idempotency_pair"].sqltext).split())
+    lengths_sql = " ".join(str(constraints["ck_tasks_idempotency_hash_lengths"].sqltext).split())
+    assert pair_sql == ("(idempotency_key_hash IS NULL) = (request_fingerprint IS NULL)")
+    assert lengths_sql.count("octet_length(idempotency_key_hash) = 32") == 1
+    assert lengths_sql.count("octet_length(request_fingerprint) = 32") == 1
+
+
 def test_task_indexes_match_list_and_recovery_queries() -> None:
     """Indexes support deterministic pagination, filters, and lease recovery."""
 
@@ -115,11 +142,16 @@ def test_task_indexes_match_list_and_recovery_queries() -> None:
     assert set(indexes) == {
         "ix_tasks_created_at_id",
         "ix_tasks_expired_lease",
+        "ix_tasks_idempotency_key_hash",
         "ix_tasks_priority_created_at_id",
         "ix_tasks_status_created_at_id",
     }
     assert "WHERE status = 'IN_PROGRESS'" in _index_sql(indexes["ix_tasks_expired_lease"])
     assert "created_at DESC, id DESC" in _index_sql(indexes["ix_tasks_created_at_id"])
+    idempotency_index = indexes["ix_tasks_idempotency_key_hash"]
+    assert idempotency_index.unique is True
+    assert list(idempotency_index.columns.keys()) == ["idempotency_key_hash"]
+    assert "WHERE idempotency_key_hash IS NOT NULL" in _index_sql(idempotency_index)
 
 
 def test_outbox_columns_cover_publication_lifecycle() -> None:
@@ -203,6 +235,7 @@ def test_postgresql_ddl_uses_portable_enums_and_native_storage_types() -> None:
 
     assert "UUID NOT NULL" in task_ddl
     assert "JSONB" in task_ddl
+    assert task_ddl.count("BYTEA") == 2
     assert "TIMESTAMP WITH TIME ZONE" in task_ddl
     assert "VARCHAR(8)" in task_ddl
     assert "VARCHAR(16)" in task_ddl

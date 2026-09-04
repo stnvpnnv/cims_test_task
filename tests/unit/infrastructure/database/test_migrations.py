@@ -12,7 +12,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy.dialects.postgresql.base import PGDialect
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.schema import CreateIndex
 
 from cims_task_service.infrastructure.database.base import Base
 from cims_task_service.infrastructure.database.models import (
@@ -23,6 +23,8 @@ from cims_task_service.infrastructure.database.models import (
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _CONFIG_PATH = _PROJECT_ROOT / "pyproject.toml"
 _DSN_SENTINEL = "must-not-appear-in-migration-output"
+_BASE_REVISION = "db0f59be3ae6"
+_IDEMPOTENCY_REVISION = "61d66cf078b9"
 _POSTGRESQL_DIALECT = PGDialect()  # type: ignore[no-untyped-call]
 
 
@@ -66,11 +68,12 @@ def test_revision_history_has_one_base_and_a_single_linear_head() -> None:
     revisions = list(script.walk_revisions())
     heads = script.get_heads()
 
-    assert script.get_bases() == ["db0f59be3ae6"]
+    assert script.get_bases() == [_BASE_REVISION]
     assert len(heads) == 1
+    assert heads == [_IDEMPOTENCY_REVISION]
     assert revisions
     assert revisions[0].revision == heads[0]
-    assert revisions[-1].revision == "db0f59be3ae6"
+    assert revisions[-1].revision == _BASE_REVISION
     assert revisions[-1].down_revision is None
     assert all(revision.is_branch_point is False for revision in revisions)
     assert all(revision.is_merge_point is False for revision in revisions)
@@ -78,12 +81,12 @@ def test_revision_history_has_one_base_and_a_single_linear_head() -> None:
         assert revision.down_revision == parent.revision
 
 
-def test_offline_upgrade_renders_complete_postgresql_schema(
+def test_offline_upgrade_renders_complete_migration_chain(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Upgrade SQL mirrors metadata without connecting or exposing credentials."""
+    """The full upgrade stays offline, ordered, and free of credentials."""
 
     _guard_offline_mode(monkeypatch)
     output = StringIO()
@@ -96,13 +99,12 @@ def test_offline_upgrade_renders_complete_postgresql_schema(
     assert sql.startswith("BEGIN;")
     assert sql.endswith("COMMIT;")
     assert sql.index("CREATE TABLE tasks") < sql.index("CREATE TABLE outbox_events")
+    assert sql.index("CREATE TABLE outbox_events") < sql.index(
+        "ALTER TABLE tasks ADD COLUMN idempotency_key_hash BYTEA"
+    )
     assert TaskModel.metadata is Base.metadata
     assert OutboxEventModel.metadata is Base.metadata
     for table in Base.metadata.sorted_tables:
-        expected_table = _normalize_sql(
-            str(CreateTable(table).compile(dialect=_POSTGRESQL_DIALECT))
-        )
-        assert expected_table in sql
         for index in table.indexes:
             expected_index = _normalize_sql(
                 str(CreateIndex(index).compile(dialect=_POSTGRESQL_DIALECT))
@@ -116,15 +118,93 @@ def test_offline_upgrade_renders_complete_postgresql_schema(
     assert _DSN_SENTINEL not in log_output
 
 
-def test_offline_downgrade_removes_dependent_schema_first(
+def test_offline_idempotency_upgrade_adds_bounded_unique_hashes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Downgrade SQL removes outbox objects before their task dependency."""
+    """The additive revision creates paired hashes before their unique index."""
 
     _guard_offline_mode(monkeypatch)
     output = StringIO()
 
-    command.downgrade(_alembic_config(output), "head:base", sql=True)
+    command.upgrade(
+        _alembic_config(output),
+        f"{_BASE_REVISION}:{_IDEMPOTENCY_REVISION}",
+        sql=True,
+    )
+
+    sql = _normalize_sql(output.getvalue())
+    key_column = "ALTER TABLE tasks ADD COLUMN idempotency_key_hash BYTEA;"
+    fingerprint_column = "ALTER TABLE tasks ADD COLUMN request_fingerprint BYTEA;"
+    pair_constraint = (
+        "ALTER TABLE tasks ADD CONSTRAINT ck_tasks_idempotency_pair "
+        "CHECK ((idempotency_key_hash IS NULL) = (request_fingerprint IS NULL));"
+    )
+    lengths_constraint = (
+        "ALTER TABLE tasks ADD CONSTRAINT ck_tasks_idempotency_hash_lengths "
+        "CHECK ((idempotency_key_hash IS NULL "
+        "OR octet_length(idempotency_key_hash) = 32) "
+        "AND (request_fingerprint IS NULL "
+        "OR octet_length(request_fingerprint) = 32));"
+    )
+    unique_index = (
+        "CREATE UNIQUE INDEX ix_tasks_idempotency_key_hash "
+        "ON tasks (idempotency_key_hash) WHERE idempotency_key_hash IS NOT NULL;"
+    )
+
+    assert sql.startswith("BEGIN;")
+    assert sql.endswith("COMMIT;")
+    assert "CREATE TABLE" not in sql
+    assert sql.index(key_column) < sql.index(fingerprint_column)
+    assert sql.index(fingerprint_column) < sql.index(pair_constraint)
+    assert sql.index(pair_constraint) < sql.index(lengths_constraint)
+    assert sql.index(lengths_constraint) < sql.index(unique_index)
+    assert "ADD COLUMN idempotency_key_hash BYTEA NOT NULL" not in sql
+    assert "ADD COLUMN request_fingerprint BYTEA NOT NULL" not in sql
+
+
+def test_offline_idempotency_downgrade_removes_dependants_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The additive revision drops indexes and checks before their columns."""
+
+    _guard_offline_mode(monkeypatch)
+    output = StringIO()
+
+    command.downgrade(
+        _alembic_config(output),
+        f"{_IDEMPOTENCY_REVISION}:{_BASE_REVISION}",
+        sql=True,
+    )
+
+    sql = _normalize_sql(output.getvalue())
+    drop_index = "DROP INDEX ix_tasks_idempotency_key_hash;"
+    drop_lengths = "ALTER TABLE tasks DROP CONSTRAINT ck_tasks_idempotency_hash_lengths;"
+    drop_pair = "ALTER TABLE tasks DROP CONSTRAINT ck_tasks_idempotency_pair;"
+    drop_fingerprint = "ALTER TABLE tasks DROP COLUMN request_fingerprint;"
+    drop_key = "ALTER TABLE tasks DROP COLUMN idempotency_key_hash;"
+
+    assert sql.startswith("BEGIN;")
+    assert sql.endswith("COMMIT;")
+    assert "DROP TABLE" not in sql
+    assert sql.index(drop_index) < sql.index(drop_lengths)
+    assert sql.index(drop_lengths) < sql.index(drop_pair)
+    assert sql.index(drop_pair) < sql.index(drop_fingerprint)
+    assert sql.index(drop_fingerprint) < sql.index(drop_key)
+
+
+def test_offline_base_downgrade_removes_dependent_schema_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The base downgrade removes outbox objects before their task dependency."""
+
+    _guard_offline_mode(monkeypatch)
+    output = StringIO()
+
+    command.downgrade(
+        _alembic_config(output),
+        f"{_BASE_REVISION}:base",
+        sql=True,
+    )
 
     sql = _normalize_sql(output.getvalue())
     assert sql.startswith("BEGIN;")

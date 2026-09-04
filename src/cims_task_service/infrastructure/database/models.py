@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     SmallInteger,
     String,
     Text,
@@ -33,6 +34,26 @@ class TaskModel(Base):
     __tablename__ = "tasks"
     __table_args__ = (
         CheckConstraint("name ~ '[^[:space:]]'", name="name_nonblank"),
+        CheckConstraint(
+            """
+            (idempotency_key_hash IS NULL)
+            = (request_fingerprint IS NULL)
+            """,
+            name="idempotency_pair",
+        ),
+        CheckConstraint(
+            """
+            (
+                idempotency_key_hash IS NULL
+                OR octet_length(idempotency_key_hash) = 32
+            )
+            AND (
+                request_fingerprint IS NULL
+                OR octet_length(request_fingerprint) = 32
+            )
+            """,
+            name="idempotency_hash_lengths",
+        ),
         CheckConstraint(
             """
             attempt_count >= 0
@@ -169,6 +190,14 @@ class TaskModel(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+    )
+    idempotency_key_hash: Mapped[bytes | None] = mapped_column(
+        LargeBinary(32),
+        nullable=True,
+    )
+    request_fingerprint: Mapped[bytes | None] = mapped_column(
+        LargeBinary(32),
+        nullable=True,
     )
     started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
@@ -321,6 +350,12 @@ Index(
     TaskModel.lease_expires_at,
     TaskModel.id,
     postgresql_where=TaskModel.status == TaskStatus.IN_PROGRESS,
+)
+Index(
+    "ix_tasks_idempotency_key_hash",
+    TaskModel.idempotency_key_hash,
+    unique=True,
+    postgresql_where=TaskModel.idempotency_key_hash.is_not(None),
 )
 
 Index(

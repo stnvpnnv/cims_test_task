@@ -22,6 +22,7 @@ def create_database_engine(settings: Settings) -> AsyncEngine:
         pool_timeout=settings.database_pool_timeout_seconds,
         pool_recycle=settings.database_pool_recycle_seconds,
         pool_pre_ping=True,
+        isolation_level="READ COMMITTED",
         hide_parameters=True,
         connect_args={
             "server_settings": {

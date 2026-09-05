@@ -12,6 +12,7 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_DATABASE_MAX_OVERFLOW",
     "CIMS_DATABASE_POOL_TIMEOUT_SECONDS",
     "CIMS_DATABASE_POOL_RECYCLE_SECONDS",
+    "CIMS_TASK_MAX_ATTEMPTS",
     "CIMS_RABBITMQ_URL",
     "CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS",
     "CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS",
@@ -38,6 +39,7 @@ def test_settings_have_safe_non_secret_defaults() -> None:
     assert settings.database_max_overflow == 10
     assert settings.database_pool_timeout_seconds == 30.0
     assert settings.database_pool_recycle_seconds == 1800
+    assert settings.task_max_attempts == 3
     assert settings.rabbitmq_url.get_secret_value() == ("amqp://cims@localhost:5672/cims")
     assert settings.rabbitmq_connection_timeout_seconds == 10.0
     assert settings.rabbitmq_reconnect_interval_seconds == 5.0
@@ -56,6 +58,7 @@ def test_settings_load_environment_overrides(
     monkeypatch.setenv("CIMS_DATABASE_MAX_OVERFLOW", "3")
     monkeypatch.setenv("CIMS_DATABASE_POOL_TIMEOUT_SECONDS", "11.5")
     monkeypatch.setenv("CIMS_DATABASE_POOL_RECYCLE_SECONDS", "600")
+    monkeypatch.setenv("CIMS_TASK_MAX_ATTEMPTS", "5")
     monkeypatch.setenv(
         "CIMS_RABBITMQ_URL",
         "amqp://service:rabbit-secret@rabbitmq:5672/tasks",
@@ -72,6 +75,7 @@ def test_settings_load_environment_overrides(
     assert settings.database_max_overflow == 3
     assert settings.database_pool_timeout_seconds == 11.5
     assert settings.database_pool_recycle_seconds == 600
+    assert settings.task_max_attempts == 5
     assert settings.rabbitmq_url.get_secret_value() == (
         "amqp://service:rabbit-secret@rabbitmq:5672/tasks"
     )
@@ -211,6 +215,7 @@ def test_rabbitmq_settings_reject_invalid_urls_without_leaking_credentials(
         ("CIMS_DATABASE_MAX_OVERFLOW", "-1"),
         ("CIMS_DATABASE_POOL_TIMEOUT_SECONDS", "0"),
         ("CIMS_DATABASE_POOL_RECYCLE_SECONDS", "0"),
+        ("CIMS_TASK_MAX_ATTEMPTS", "0"),
         ("CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS", "0"),
         ("CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS", "-0.1"),
         ("CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS", "0"),

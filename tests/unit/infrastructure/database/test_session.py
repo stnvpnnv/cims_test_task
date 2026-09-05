@@ -54,6 +54,7 @@ def test_engine_factory_applies_connection_and_pool_policy(
         "pool_timeout": 11.5,
         "pool_recycle": 600,
         "pool_pre_ping": True,
+        "isolation_level": "READ COMMITTED",
         "hide_parameters": True,
         "connect_args": {
             "server_settings": {

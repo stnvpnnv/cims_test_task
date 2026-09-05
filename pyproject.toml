@@ -113,7 +113,7 @@ asyncio_default_test_loop_scope = "function"
 asyncio_mode = "strict"
 filterwarnings = ["error"]
 markers = [
-  "integration: requires PostgreSQL and RabbitMQ",
+  "integration: requires external services such as PostgreSQL or RabbitMQ",
 ]
 minversion = "9.1"
 testpaths = ["tests"]

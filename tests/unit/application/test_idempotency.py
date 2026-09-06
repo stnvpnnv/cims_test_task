@@ -15,7 +15,7 @@ def test_idempotency_key_hash_has_a_stable_scoped_representation() -> None:
     digest = hash_task_creation_idempotency_key("8e03978e-40d5-43e8-bc93-6894a57f9324")
 
     assert digest == bytes.fromhex(
-        "cf9df451772168e92618032806dd96bfeb8d503770d952401762317f88cc17d7"
+        "10379bd6e76166a504456b71382ecd302137fe95b831f952e54ca65eff7887ed"
     )
 
 
@@ -31,7 +31,7 @@ def test_request_fingerprint_has_a_stable_canonical_representation() -> None:
     )
 
     assert digest == bytes.fromhex(
-        "102bfee7ef49c41d63258cea406f2ef7346b4d2680fea703db81bb7879e7bb58"
+        "5f388e8107db37e885cdca06e64a4a476290b74092ecd5f286760c5bee4e698e"
     )
 
 

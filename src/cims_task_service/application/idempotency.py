@@ -6,8 +6,8 @@ from typing import Final
 
 from cims_task_service.domain.task import TaskPriority
 
-_KEY_HASH_DOMAIN: Final = b"POST /tasks:v1:idempotency-key\x00"
-_REQUEST_FINGERPRINT_DOMAIN: Final = b"POST /tasks:v1:request-fingerprint\x00"
+_KEY_HASH_DOMAIN: Final = b"cims:task-creation:v1:idempotency-key\x00"
+_REQUEST_FINGERPRINT_DOMAIN: Final = b"cims:task-creation:v1:request-fingerprint\x00"
 
 
 def hash_task_creation_idempotency_key(key: str) -> bytes:

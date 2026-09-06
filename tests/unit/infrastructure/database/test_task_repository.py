@@ -1,4 +1,4 @@
-"""Tests for task creation persistence and transactional outbox behavior."""
+"""Tests for task persistence and transactional outbox behavior."""
 
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
@@ -81,6 +81,35 @@ def _compiled_parameters(statement: ClauseElement) -> dict[str, object]:
         dict[str, object],
         statement.compile(dialect=_POSTGRESQL_DIALECT).params,
     )
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_the_task_from_primary_key_lookup(
+    inserted_task: TaskModel,
+) -> None:
+    """A matching primary key returns the ORM task without a locking query."""
+
+    get = AsyncMock(return_value=inserted_task)
+    session = cast(AsyncSession, Mock(get=get))
+
+    task = await TaskRepository(session).get_by_id(inserted_task.id)
+
+    assert task is inserted_task
+    get.assert_awaited_once_with(TaskModel, inserted_task.id)
+
+
+@pytest.mark.asyncio
+async def test_get_by_id_returns_none_for_an_unknown_primary_key() -> None:
+    """A missing primary key remains distinguishable from persistence failure."""
+
+    task_id = UUID("ba21a692-6c11-47ac-bc71-392f27f03416")
+    get = AsyncMock(return_value=None)
+    session = cast(AsyncSession, Mock(get=get))
+
+    task = await TaskRepository(session).get_by_id(task_id)
+
+    assert task is None
+    get.assert_awaited_once_with(TaskModel, task_id)
 
 
 @pytest.mark.asyncio

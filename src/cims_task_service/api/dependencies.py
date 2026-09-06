@@ -3,6 +3,7 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Annotated, cast
+from uuid import UUID
 
 from fastapi import Depends, Request
 
@@ -11,9 +12,12 @@ from cims_task_service.application.task_creation import (
     CreateTaskResult,
     create_task,
 )
+from cims_task_service.application.task_queries import get_task
+from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 
 type TaskCreator = Callable[[CreateTaskCommand], Awaitable[CreateTaskResult]]
+type TaskReader = Callable[[UUID], Awaitable[TaskModel]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,3 +47,17 @@ def get_task_creator(
         )
 
     return create
+
+
+def get_task_reader(
+    resources: Annotated[ApplicationResources, Depends(get_application_resources)],
+) -> TaskReader:
+    """Bind the task query use case to this application's resources."""
+
+    async def read(task_id: UUID) -> TaskModel:
+        return await get_task(
+            task_id,
+            session_factory=resources.session_factory,
+        )
+
+    return read

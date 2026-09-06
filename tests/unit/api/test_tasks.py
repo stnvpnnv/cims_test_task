@@ -1,8 +1,8 @@
-"""HTTP contract tests for task creation."""
+"""HTTP contract tests for task operations."""
 
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid1, uuid4
 
 import pytest
 from fastapi import FastAPI
@@ -14,6 +14,7 @@ from cims_task_service.application.task_creation import (
     CreateTaskResult,
     IdempotencyKeyConflictError,
 )
+from cims_task_service.application.task_queries import TaskNotFoundError
 from cims_task_service.config import Settings
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database.models import TaskModel
@@ -57,6 +58,12 @@ def _request_body() -> dict[str, str]:
 def _application_with_task_creator(task_creator: AsyncMock) -> FastAPI:
     application = create_app(Settings())
     application.dependency_overrides[api_dependencies.get_task_creator] = lambda: task_creator
+    return application
+
+
+def _application_with_task_reader(task_reader: AsyncMock) -> FastAPI:
+    application = create_app(Settings())
+    application.dependency_overrides[api_dependencies.get_task_reader] = lambda: task_reader
     return application
 
 
@@ -208,6 +215,95 @@ def test_invalid_request_is_rejected_before_task_creation(
     creator.assert_not_awaited()
 
 
+def test_get_task_returns_the_complete_current_public_resource() -> None:
+    """A detail read exposes current lifecycle data without persistence metadata."""
+
+    task = _task(completed=True)
+    reader = AsyncMock(return_value=task)
+    application = _application_with_task_reader(reader)
+
+    with TestClient(application) as client:
+        response = client.get(f"/api/v1/tasks/{task.id}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": str(task.id),
+        "name": task.name,
+        "description": task.description,
+        "priority": "HIGH",
+        "status": "COMPLETED",
+        "created_at": "2026-09-06T01:02:03Z",
+        "started_at": "2026-09-06T01:02:04Z",
+        "finished_at": "2026-09-06T01:02:05Z",
+        "result": {"records": 42},
+        "error": None,
+    }
+    reader.assert_awaited_once_with(task.id)
+    assert "idempotency_key_hash" not in response.text
+    assert "request_fingerprint" not in response.text
+    assert "attempt_count" not in response.text
+    assert "dispatch_token" not in response.text
+
+
+def test_get_task_dependency_binds_the_application_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production dependency forwards the parsed UUID and lifespan resource."""
+
+    task = _task()
+    get_task = AsyncMock(return_value=task)
+    monkeypatch.setattr(api_dependencies, "get_task", get_task)
+    application = create_app(Settings())
+
+    with TestClient(application) as client:
+        response = client.get(f"/api/v1/tasks/{task.id}")
+        session_factory = application.state.resources.session_factory
+
+    assert response.status_code == 200
+    get_task.assert_awaited_once_with(
+        task.id,
+        session_factory=session_factory,
+    )
+
+
+def test_get_unknown_task_returns_problem_details_without_its_identifier() -> None:
+    """A missing task has a stable semantic error without echoing its identifier."""
+
+    task_id = UUID("ba21a692-6c11-47ac-bc71-392f27f03416")
+    reader = AsyncMock(side_effect=TaskNotFoundError(task_id))
+    application = _application_with_task_reader(reader)
+
+    with TestClient(application) as client:
+        response = client.get(f"/api/v1/tasks/{task_id}")
+
+    assert response.status_code == 404
+    assert response.headers["content-type"] == "application/problem+json"
+    assert response.json() == {
+        "type": "urn:cims-task-service:problem:task-not-found",
+        "title": "Task not found",
+        "status": 404,
+        "detail": "The requested task does not exist.",
+    }
+    reader.assert_awaited_once_with(task_id)
+    assert str(task_id) not in response.text
+
+
+@pytest.mark.parametrize("task_id", ["not-a-uuid", str(uuid1())])
+def test_get_task_rejects_invalid_uuid_before_reading(task_id: str) -> None:
+    """Malformed and non-v4 identifiers retain FastAPI's validation response."""
+
+    reader = AsyncMock()
+    application = _application_with_task_reader(reader)
+
+    with TestClient(application) as client:
+        response = client.get(f"/api/v1/tasks/{task_id}")
+
+    assert response.status_code == 422
+    assert response.headers["content-type"].startswith("application/json")
+    assert isinstance(response.json()["detail"], list)
+    reader.assert_not_awaited()
+
+
 def test_openapi_documents_the_complete_task_creation_contract() -> None:
     """The canonical PDF route exposes both success and 422 response formats."""
 
@@ -239,3 +335,33 @@ def test_openapi_documents_the_complete_task_creation_contract() -> None:
     }
     problem_schema = error_content["application/problem+json"]["schema"]
     assert set(problem_schema["required"]) == {"type", "title", "status", "detail"}
+
+
+def test_openapi_documents_the_task_detail_contract() -> None:
+    """Task lookup documents UUID v4 validation and both error formats."""
+
+    with TestClient(create_app(Settings())) as client:
+        schema = client.get("/openapi.json").json()
+
+    operation = schema["paths"]["/api/v1/tasks/{task_id}"]["get"]
+    task_id_parameter = next(
+        parameter for parameter in operation["parameters"] if parameter["name"] == "task_id"
+    )
+    assert task_id_parameter["in"] == "path"
+    assert task_id_parameter["required"] is True
+    assert task_id_parameter["schema"]["format"] == "uuid4"
+    assert set(operation["responses"]) >= {"200", "404", "422"}
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/TaskResponse"
+    }
+    not_found_content = operation["responses"]["404"]["content"]
+    assert set(not_found_content) == {"application/problem+json"}
+    assert set(not_found_content["application/problem+json"]["schema"]["required"]) == {
+        "type",
+        "title",
+        "status",
+        "detail",
+    }
+    assert operation["responses"]["422"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/HTTPValidationError"
+    }

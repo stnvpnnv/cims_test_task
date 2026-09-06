@@ -4,14 +4,21 @@ from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
+from pydantic import UUID4
 
-from cims_task_service.api.dependencies import TaskCreator, get_task_creator
+from cims_task_service.api.dependencies import (
+    TaskCreator,
+    TaskReader,
+    get_task_creator,
+    get_task_reader,
+)
 from cims_task_service.api.schemas.problem import ProblemDetails
 from cims_task_service.api.schemas.task import CreateTaskRequest, TaskResponse
 from cims_task_service.application.task_creation import (
     CreateTaskCommand,
     IdempotencyKeyConflictError,
 )
+from cims_task_service.application.task_queries import TaskNotFoundError
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -21,6 +28,12 @@ _IDEMPOTENCY_CONFLICT = ProblemDetails(
     title="Idempotency-Key is already used",
     status=status.HTTP_422_UNPROCESSABLE_CONTENT,
     detail="The Idempotency-Key header was already used with a different request body.",
+)
+_TASK_NOT_FOUND = ProblemDetails(
+    type="urn:cims-task-service:problem:task-not-found",
+    title="Task not found",
+    status=status.HTTP_404_NOT_FOUND,
+    detail="The requested task does not exist.",
 )
 _LOCATION_HEADER: Final[dict[str, object]] = {
     "description": "Relative URI of the created or replayed task resource.",
@@ -60,12 +73,12 @@ def _get_idempotency_key(
     return idempotency_key
 
 
-def _idempotency_conflict_response() -> JSONResponse:
-    """Return a stable response without exposing the key or existing task."""
+def _problem_response(problem: ProblemDetails) -> JSONResponse:
+    """Serialize stable Problem Details without exposing internal state."""
 
     return JSONResponse(
-        status_code=_IDEMPOTENCY_CONFLICT.status,
-        content=_IDEMPOTENCY_CONFLICT.model_dump(mode="json"),
+        status_code=problem.status,
+        content=problem.model_dump(mode="json"),
         media_type="application/problem+json",
     )
 
@@ -117,8 +130,38 @@ async def create_task(
     try:
         result = await task_creator(command)
     except IdempotencyKeyConflictError:
-        return _idempotency_conflict_response()
+        return _problem_response(_IDEMPOTENCY_CONFLICT)
 
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     response.headers["Location"] = f"/api/v1/tasks/{result.task.id}"
     return TaskResponse.model_validate(result.task, from_attributes=True)
+
+
+@router.get(
+    "/{task_id}",
+    name="get_task",
+    response_model=TaskResponse,
+    summary="Get a task",
+    responses={
+        status.HTTP_404_NOT_FOUND: {
+            "description": "No task exists with the supplied identifier.",
+            "content": {
+                "application/problem+json": {
+                    "schema": ProblemDetails.model_json_schema(),
+                }
+            },
+        }
+    },
+)
+async def read_task(
+    task_id: UUID4,
+    task_reader: Annotated[TaskReader, Depends(get_task_reader)],
+) -> TaskResponse | JSONResponse:
+    """Return the current representation of one task."""
+
+    try:
+        task = await task_reader(task_id)
+    except TaskNotFoundError:
+        return _problem_response(_TASK_NOT_FOUND)
+
+    return TaskResponse.model_validate(task, from_attributes=True)

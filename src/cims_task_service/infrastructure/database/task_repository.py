@@ -1,7 +1,7 @@
-"""Persistence operations for creating tasks and their outbox events."""
+"""Persistence operations for task aggregates and their outbox events."""
 
 from dataclasses import dataclass
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
@@ -27,6 +27,11 @@ class TaskRepository:
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
+
+    async def get_by_id(self, task_id: UUID) -> TaskModel | None:
+        """Return a task by primary key without acquiring a row lock."""
+
+        return await self._session.get(TaskModel, task_id)
 
     async def create_with_outbox(
         self,

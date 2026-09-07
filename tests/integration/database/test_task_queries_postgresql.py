@@ -6,9 +6,14 @@ from uuid import UUID
 import pytest
 
 from cims_task_service.application.task_creation import CreateTaskCommand, create_task
-from cims_task_service.application.task_queries import TaskNotFoundError, get_task
+from cims_task_service.application.task_queries import (
+    TaskNotFoundError,
+    get_task,
+    get_task_status,
+)
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
+from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -66,6 +71,47 @@ async def test_get_task_raises_for_an_unknown_identifier(
 
     with pytest.raises(TaskNotFoundError) as error_info:
         await get_task(
+            task_id,
+            session_factory=postgres_session_factory,
+        )
+
+    assert error_info.value.task_id == task_id
+
+
+async def test_get_task_status_returns_the_persisted_projection(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """A committed task status is read as the exact lightweight snapshot."""
+
+    created = await create_task(
+        CreateTaskCommand(
+            name="Refresh materialized view",
+            description="Rebuild the reporting projection",
+            priority=TaskPriority.MEDIUM,
+        ),
+        session_factory=postgres_session_factory,
+        max_attempts=3,
+    )
+
+    snapshot = await get_task_status(
+        created.task.id,
+        session_factory=postgres_session_factory,
+    )
+
+    assert created.created is True
+    assert snapshot == TaskStatusSnapshot(id=created.task.id, status=TaskStatus.NEW)
+    assert snapshot.status is TaskStatus.NEW
+
+
+async def test_get_task_status_raises_for_an_unknown_identifier(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """A missing status projection reports the identifier requested by the caller."""
+
+    task_id = UUID("0a6757ba-0dc8-4d87-b31c-cbfb78d308e4")
+
+    with pytest.raises(TaskNotFoundError) as error_info:
+        await get_task_status(
             task_id,
             session_factory=postgres_session_factory,
         )

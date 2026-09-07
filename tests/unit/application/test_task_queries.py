@@ -10,9 +10,14 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.application import task_queries as task_queries_module
-from cims_task_service.application.task_queries import TaskNotFoundError, get_task
+from cims_task_service.application.task_queries import (
+    TaskNotFoundError,
+    get_task,
+    get_task_status,
+)
 from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
+from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,15 +28,22 @@ class _QueryHarness:
     session_context: AsyncMock
     repository_factory: Mock
     get_by_id: AsyncMock
+    get_status_by_id: AsyncMock
 
 
 def _query_harness(
     monkeypatch: pytest.MonkeyPatch,
     task: TaskModel | None,
+    *,
+    status_snapshot: TaskStatusSnapshot | None = None,
 ) -> _QueryHarness:
     session = cast(AsyncSession, object())
     get_by_id = AsyncMock(return_value=task)
-    repository = SimpleNamespace(get_by_id=get_by_id)
+    get_status_by_id = AsyncMock(return_value=status_snapshot)
+    repository = SimpleNamespace(
+        get_by_id=get_by_id,
+        get_status_by_id=get_status_by_id,
+    )
     repository_factory = Mock(return_value=repository)
     monkeypatch.setattr(task_queries_module, "TaskRepository", repository_factory)
 
@@ -47,6 +59,7 @@ def _query_harness(
         session_context=session_context,
         repository_factory=repository_factory,
         get_by_id=get_by_id,
+        get_status_by_id=get_status_by_id,
     )
 
 
@@ -84,6 +97,53 @@ async def test_get_task_raises_not_found_inside_session_context(
 
     assert error_info.value.task_id == task_id
     harness.get_by_id.assert_awaited_once_with(task_id)
+    exit_call = harness.session_context.__aexit__.await_args
+    assert exit_call is not None
+    assert exit_call.args[0] is TaskNotFoundError
+    assert exit_call.args[1] is error_info.value
+    assert exit_call.args[2] is not None
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_returns_snapshot_after_closing_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful status query closes its read session before returning."""
+
+    task_id = uuid4()
+    snapshot = cast(TaskStatusSnapshot, object())
+    harness = _query_harness(
+        monkeypatch,
+        None,
+        status_snapshot=snapshot,
+    )
+
+    result = await get_task_status(task_id, session_factory=harness.session_factory)
+
+    assert result is snapshot
+    harness.create_session.assert_called_once_with()
+    harness.session_context.__aenter__.assert_awaited_once_with()
+    harness.repository_factory.assert_called_once_with(harness.session)
+    harness.get_status_by_id.assert_awaited_once_with(task_id)
+    harness.get_by_id.assert_not_awaited()
+    harness.session_context.__aexit__.assert_awaited_once_with(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_get_task_status_raises_not_found_inside_session_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing status reuses the task-not-found error and closes its session."""
+
+    task_id = uuid4()
+    harness = _query_harness(monkeypatch, None)
+
+    with pytest.raises(TaskNotFoundError) as error_info:
+        await get_task_status(task_id, session_factory=harness.session_factory)
+
+    assert error_info.value.task_id == task_id
+    harness.get_status_by_id.assert_awaited_once_with(task_id)
+    harness.get_by_id.assert_not_awaited()
     exit_call = harness.session_context.__aexit__.await_args
     assert exit_call is not None
     assert exit_call.args[0] is TaskNotFoundError

@@ -19,6 +19,7 @@ from cims_task_service.infrastructure.database.models import (
 from cims_task_service.infrastructure.database.task_repository import (
     StoredTaskCreation,
     TaskRepository,
+    TaskStatusSnapshot,
 )
 
 _POSTGRESQL_DIALECT = PGDialect()  # type: ignore[no-untyped-call]
@@ -32,6 +33,16 @@ class _ScalarResult:
 
     def one_or_none(self) -> TaskModel | None:
         return self._one_or_none
+
+
+class _RowResult:
+    """Minimal row-result double for projected task reads."""
+
+    def __init__(self, row: tuple[UUID, TaskStatus] | None) -> None:
+        self._row = row
+
+    def one_or_none(self) -> tuple[UUID, TaskStatus] | None:
+        return self._row
 
 
 @pytest.fixture
@@ -110,6 +121,44 @@ async def test_get_by_id_returns_none_for_an_unknown_primary_key() -> None:
 
     assert task is None
     get.assert_awaited_once_with(TaskModel, task_id)
+
+
+@pytest.mark.asyncio
+async def test_get_status_by_id_selects_an_exact_status_snapshot() -> None:
+    """The status query projects only its two public fields by primary key."""
+
+    task_id = UUID("dc2e9988-f896-4316-bfb3-56d2b66ed186")
+    execute = AsyncMock(return_value=_RowResult((task_id, TaskStatus.IN_PROGRESS)))
+    session = cast(AsyncSession, Mock(execute=execute))
+
+    snapshot = await TaskRepository(session).get_status_by_id(task_id)
+
+    assert snapshot == TaskStatusSnapshot(id=task_id, status=TaskStatus.IN_PROGRESS)
+    execute.assert_awaited_once()
+    assert execute.await_args is not None
+    statement = execute.await_args.args[0]
+    sql = _compiled_sql(statement)
+    assert sql.startswith("SELECT tasks.id, tasks.status FROM tasks WHERE tasks.id =")
+    assert "tasks.name" not in sql
+    assert " FOR UPDATE" not in sql
+    assert _compiled_parameters(statement) == {"id_1": task_id}
+
+
+@pytest.mark.asyncio
+async def test_get_status_by_id_returns_none_for_an_unknown_primary_key() -> None:
+    """An unknown identifier produces no synthetic status snapshot."""
+
+    task_id = UUID("ba21a692-6c11-47ac-bc71-392f27f03416")
+    execute = AsyncMock(return_value=_RowResult(None))
+    session = cast(AsyncSession, Mock(execute=execute))
+
+    snapshot = await TaskRepository(session).get_status_by_id(task_id)
+
+    assert snapshot is None
+    execute.assert_awaited_once()
+    assert execute.await_args is not None
+    statement = execute.await_args.args[0]
+    assert _compiled_parameters(statement) == {"id_1": task_id}
 
 
 @pytest.mark.asyncio

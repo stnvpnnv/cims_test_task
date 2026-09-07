@@ -12,12 +12,14 @@ from cims_task_service.application.task_creation import (
     CreateTaskResult,
     create_task,
 )
-from cims_task_service.application.task_queries import get_task
+from cims_task_service.application.task_queries import get_task, get_task_status
 from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
+from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot
 
 type TaskCreator = Callable[[CreateTaskCommand], Awaitable[CreateTaskResult]]
 type TaskReader = Callable[[UUID], Awaitable[TaskModel]]
+type TaskStatusReader = Callable[[UUID], Awaitable[TaskStatusSnapshot]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,3 +63,17 @@ def get_task_reader(
         )
 
     return read
+
+
+def get_task_status_reader(
+    resources: Annotated[ApplicationResources, Depends(get_application_resources)],
+) -> TaskStatusReader:
+    """Bind the task status query to this application's resources."""
+
+    async def read_status(task_id: UUID) -> TaskStatusSnapshot:
+        return await get_task_status(
+            task_id,
+            session_factory=resources.session_factory,
+        )
+
+    return read_status

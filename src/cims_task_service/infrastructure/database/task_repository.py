@@ -15,6 +15,14 @@ from cims_task_service.infrastructure.database.models import (
 
 
 @dataclass(frozen=True, slots=True)
+class TaskStatusSnapshot:
+    """Minimal persisted state required by the status endpoint."""
+
+    id: UUID
+    status: TaskStatus
+
+
+@dataclass(frozen=True, slots=True)
 class StoredTaskCreation:
     """Persisted task together with whether this call created it."""
 
@@ -32,6 +40,17 @@ class TaskRepository:
         """Return a task by primary key without acquiring a row lock."""
 
         return await self._session.get(TaskModel, task_id)
+
+    async def get_status_by_id(self, task_id: UUID) -> TaskStatusSnapshot | None:
+        """Return only the task identifier and status without locking its row."""
+
+        statement = select(TaskModel.id, TaskModel.status).where(TaskModel.id == task_id)
+        row = (await self._session.execute(statement)).one_or_none()
+        if row is None:
+            return None
+
+        stored_task_id, task_status = row
+        return TaskStatusSnapshot(id=stored_task_id, status=task_status)
 
     async def create_with_outbox(
         self,

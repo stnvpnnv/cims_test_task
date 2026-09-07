@@ -9,11 +9,17 @@ from pydantic import UUID4
 from cims_task_service.api.dependencies import (
     TaskCreator,
     TaskReader,
+    TaskStatusReader,
     get_task_creator,
     get_task_reader,
+    get_task_status_reader,
 )
 from cims_task_service.api.schemas.problem import ProblemDetails
-from cims_task_service.api.schemas.task import CreateTaskRequest, TaskResponse
+from cims_task_service.api.schemas.task import (
+    CreateTaskRequest,
+    TaskResponse,
+    TaskStatusResponse,
+)
 from cims_task_service.application.task_creation import (
     CreateTaskCommand,
     IdempotencyKeyConflictError,
@@ -165,3 +171,33 @@ async def read_task(
         return _problem_response(_TASK_NOT_FOUND)
 
     return TaskResponse.model_validate(task, from_attributes=True)
+
+
+@router.get(
+    "/{task_id}/status",
+    name="get_task_status",
+    response_model=TaskStatusResponse,
+    summary="Get a task status",
+    responses={
+        status.HTTP_404_NOT_FOUND: {
+            "description": "No task exists with the supplied identifier.",
+            "content": {
+                "application/problem+json": {
+                    "schema": ProblemDetails.model_json_schema(),
+                }
+            },
+        }
+    },
+)
+async def read_task_status(
+    task_id: UUID4,
+    task_status_reader: Annotated[TaskStatusReader, Depends(get_task_status_reader)],
+) -> TaskStatusResponse | JSONResponse:
+    """Return the current status of one task."""
+
+    try:
+        snapshot = await task_status_reader(task_id)
+    except TaskNotFoundError:
+        return _problem_response(_TASK_NOT_FOUND)
+
+    return TaskStatusResponse.model_validate(snapshot, from_attributes=True)

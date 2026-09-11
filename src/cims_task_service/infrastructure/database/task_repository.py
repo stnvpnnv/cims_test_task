@@ -3,9 +3,11 @@
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
+from sqlalchemy.sql.elements import ColumnElement
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database.models import (
@@ -20,6 +22,14 @@ class TaskStatusSnapshot:
 
     id: UUID
     status: TaskStatus
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTaskPage:
+    """One deterministic page and the exact filtered task count."""
+
+    items: tuple[TaskModel, ...]
+    total: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +61,52 @@ class TaskRepository:
 
         stored_task_id, task_status = row
         return TaskStatusSnapshot(id=stored_task_id, status=task_status)
+
+    async def list_page(
+        self,
+        *,
+        status: TaskStatus | None,
+        priority: TaskPriority | None,
+        offset: int,
+        limit: int,
+    ) -> StoredTaskPage:
+        """Return a newest-first page and exact count without locking task rows."""
+
+        conditions: list[ColumnElement[bool]] = []
+        if status is not None:
+            conditions.append(TaskModel.status == status)
+        if priority is not None:
+            conditions.append(TaskModel.priority == priority)
+
+        count_statement = select(func.count()).select_from(TaskModel).where(*conditions)
+        total = (await self._session.scalars(count_statement)).one()
+        if offset >= total:
+            return StoredTaskPage(items=(), total=total)
+
+        page_statement = (
+            select(TaskModel)
+            .options(
+                load_only(
+                    TaskModel.id,
+                    TaskModel.name,
+                    TaskModel.description,
+                    TaskModel.priority,
+                    TaskModel.status,
+                    TaskModel.created_at,
+                    TaskModel.started_at,
+                    TaskModel.finished_at,
+                    TaskModel.result,
+                    TaskModel.error,
+                    raiseload=True,
+                )
+            )
+            .where(*conditions)
+            .order_by(TaskModel.created_at.desc(), TaskModel.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        items = tuple((await self._session.scalars(page_statement)).all())
+        return StoredTaskPage(items=items, total=total)
 
     async def create_with_outbox(
         self,

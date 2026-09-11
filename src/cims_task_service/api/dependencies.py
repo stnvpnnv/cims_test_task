@@ -12,7 +12,13 @@ from cims_task_service.application.task_creation import (
     CreateTaskResult,
     create_task,
 )
-from cims_task_service.application.task_queries import get_task, get_task_status
+from cims_task_service.application.task_queries import (
+    ListTasksQuery,
+    ListTasksResult,
+    get_task,
+    get_task_status,
+    list_tasks,
+)
 from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot
@@ -20,6 +26,7 @@ from cims_task_service.infrastructure.database.task_repository import TaskStatus
 type TaskCreator = Callable[[CreateTaskCommand], Awaitable[CreateTaskResult]]
 type TaskReader = Callable[[UUID], Awaitable[TaskModel]]
 type TaskStatusReader = Callable[[UUID], Awaitable[TaskStatusSnapshot]]
+type TaskListReader = Callable[[ListTasksQuery], Awaitable[ListTasksResult]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,3 +84,17 @@ def get_task_status_reader(
         )
 
     return read_status
+
+
+def get_task_list_reader(
+    resources: Annotated[ApplicationResources, Depends(get_application_resources)],
+) -> TaskListReader:
+    """Bind the paginated task query to this application's resources."""
+
+    async def read_list(query: ListTasksQuery) -> ListTasksResult:
+        return await list_tasks(
+            query,
+            session_factory=resources.session_factory,
+        )
+
+    return read_list

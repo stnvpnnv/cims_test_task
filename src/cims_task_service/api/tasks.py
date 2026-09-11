@@ -2,21 +2,25 @@
 
 from typing import Annotated, Final
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import UUID4
 
 from cims_task_service.api.dependencies import (
     TaskCreator,
+    TaskListReader,
     TaskReader,
     TaskStatusReader,
     get_task_creator,
+    get_task_list_reader,
     get_task_reader,
     get_task_status_reader,
 )
 from cims_task_service.api.schemas.problem import ProblemDetails
 from cims_task_service.api.schemas.task import (
     CreateTaskRequest,
+    TaskListParameters,
+    TaskListResponse,
     TaskResponse,
     TaskStatusResponse,
 )
@@ -24,7 +28,7 @@ from cims_task_service.application.task_creation import (
     CreateTaskCommand,
     IdempotencyKeyConflictError,
 )
-from cims_task_service.application.task_queries import TaskNotFoundError
+from cims_task_service.application.task_queries import ListTasksQuery, TaskNotFoundError
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -141,6 +145,38 @@ async def create_task(
     response.status_code = status.HTTP_201_CREATED if result.created else status.HTTP_200_OK
     response.headers["Location"] = f"/api/v1/tasks/{result.task.id}"
     return TaskResponse.model_validate(result.task, from_attributes=True)
+
+
+@router.get(
+    "",
+    name="list_tasks",
+    response_model=TaskListResponse,
+    summary="List tasks",
+    description=(
+        "Status and priority filters are combined with AND. "
+        "Results are ordered by created_at DESC, then id DESC."
+    ),
+)
+async def list_tasks(
+    parameters: Annotated[TaskListParameters, Query()],
+    task_list_reader: Annotated[TaskListReader, Depends(get_task_list_reader)],
+) -> TaskListResponse:
+    """Return a filtered, deterministically ordered page of tasks."""
+
+    result = await task_list_reader(
+        ListTasksQuery(
+            status=parameters.status,
+            priority=parameters.priority,
+            page=parameters.page,
+            size=parameters.size,
+        )
+    )
+    return TaskListResponse(
+        items=[TaskResponse.model_validate(item, from_attributes=True) for item in result.items],
+        total=result.total,
+        page=result.page,
+        size=result.size,
+    )
 
 
 @router.get(

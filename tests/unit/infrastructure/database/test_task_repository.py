@@ -18,6 +18,7 @@ from cims_task_service.infrastructure.database.models import (
 )
 from cims_task_service.infrastructure.database.task_repository import (
     StoredTaskCreation,
+    StoredTaskPage,
     TaskRepository,
     TaskStatusSnapshot,
 )
@@ -43,6 +44,26 @@ class _RowResult:
 
     def one_or_none(self) -> tuple[UUID, TaskStatus] | None:
         return self._row
+
+
+class _CountScalarResult:
+    """Scalar-result double for an exact filtered count."""
+
+    def __init__(self, total: int) -> None:
+        self._total = total
+
+    def one(self) -> int:
+        return self._total
+
+
+class _TaskPageScalarResult:
+    """Scalar-result double for a projected task page."""
+
+    def __init__(self, items: tuple[TaskModel, ...]) -> None:
+        self._items = items
+
+    def all(self) -> tuple[TaskModel, ...]:
+        return self._items
 
 
 @pytest.fixture
@@ -159,6 +180,111 @@ async def test_get_status_by_id_returns_none_for_an_unknown_primary_key() -> Non
     assert execute.await_args is not None
     statement = execute.await_args.args[0]
     assert _compiled_parameters(statement) == {"id_1": task_id}
+
+
+@pytest.mark.parametrize(
+    ("status_filter", "priority_filter"),
+    [
+        (None, None),
+        (TaskStatus.PENDING, None),
+        (None, TaskPriority.HIGH),
+        (TaskStatus.PENDING, TaskPriority.HIGH),
+    ],
+)
+@pytest.mark.asyncio
+async def test_list_page_counts_and_selects_the_public_projection(
+    inserted_task: TaskModel,
+    status_filter: TaskStatus | None,
+    priority_filter: TaskPriority | None,
+) -> None:
+    """Every filter combination shares predicates and returns a stable page."""
+
+    scalars = AsyncMock(
+        side_effect=[
+            _CountScalarResult(37),
+            _TaskPageScalarResult((inserted_task,)),
+        ]
+    )
+    session = cast(AsyncSession, Mock(scalars=scalars))
+
+    page = await TaskRepository(session).list_page(
+        status=status_filter,
+        priority=priority_filter,
+        offset=20,
+        limit=10,
+    )
+
+    assert page == StoredTaskPage(items=(inserted_task,), total=37)
+    assert scalars.await_count == 2
+    count_statement = scalars.await_args_list[0].args[0]
+    page_statement = scalars.await_args_list[1].args[0]
+    count_sql = _compiled_sql(count_statement)
+    page_sql = _compiled_sql(page_statement)
+
+    assert count_sql.startswith("SELECT count(*) AS count_1 FROM tasks")
+    assert " ORDER BY " not in count_sql
+    assert " LIMIT " not in count_sql
+    assert " OFFSET " not in count_sql
+    assert page_sql.startswith(
+        "SELECT tasks.id, tasks.name, tasks.description, tasks.priority, tasks.status, "
+        "tasks.created_at, tasks.started_at, tasks.finished_at, tasks.result, tasks.error "
+        "FROM tasks"
+    )
+    for internal_column in (
+        "idempotency_key_hash",
+        "request_fingerprint",
+        "attempt_count",
+        "max_attempts",
+        "dispatch_token",
+        "execution_token",
+        "lease_expires_at",
+    ):
+        assert f"tasks.{internal_column}" not in page_sql
+
+    for sql in (count_sql, page_sql):
+        assert ("tasks.status =" in sql) is (status_filter is not None)
+        assert ("tasks.priority =" in sql) is (priority_filter is not None)
+        assert " FOR UPDATE" not in sql
+        if status_filter is not None and priority_filter is not None:
+            assert "tasks.status = %(status_1)s AND tasks.priority = %(priority_1)s" in sql
+
+    count_parameters = _compiled_parameters(count_statement)
+    page_parameters = _compiled_parameters(page_statement)
+    assert (status_filter in count_parameters.values()) is (status_filter is not None)
+    assert (priority_filter in count_parameters.values()) is (priority_filter is not None)
+    assert (status_filter in page_parameters.values()) is (status_filter is not None)
+    assert (priority_filter in page_parameters.values()) is (priority_filter is not None)
+    assert 10 in page_parameters.values()
+    assert 20 in page_parameters.values()
+    assert "ORDER BY tasks.created_at DESC, tasks.id DESC" in page_sql
+    assert " LIMIT " in page_sql
+    assert " OFFSET " in page_sql
+
+
+@pytest.mark.asyncio
+async def test_list_page_skips_the_page_query_when_offset_is_out_of_range() -> None:
+    """An empty page preserves its exact total without issuing a second query."""
+
+    scalars = AsyncMock(side_effect=[_CountScalarResult(7)])
+    session = cast(AsyncSession, Mock(scalars=scalars))
+
+    page = await TaskRepository(session).list_page(
+        status=TaskStatus.COMPLETED,
+        priority=TaskPriority.LOW,
+        offset=7,
+        limit=20,
+    )
+
+    assert page == StoredTaskPage(items=(), total=7)
+    scalars.assert_awaited_once()
+    assert scalars.await_args is not None
+    count_statement = scalars.await_args.args[0]
+    count_sql = _compiled_sql(count_statement)
+    assert "tasks.status = %(status_1)s AND tasks.priority = %(priority_1)s" in count_sql
+    assert _compiled_parameters(count_statement) == {
+        "status_1": TaskStatus.COMPLETED,
+        "priority_1": TaskPriority.LOW,
+    }
 
 
 @pytest.mark.asyncio

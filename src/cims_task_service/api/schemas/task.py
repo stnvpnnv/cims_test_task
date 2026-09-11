@@ -15,6 +15,11 @@ from pydantic import (
     model_validator,
 )
 
+from cims_task_service.application.task_queries import (
+    DEFAULT_TASK_PAGE,
+    DEFAULT_TASK_PAGE_SIZE,
+    MAX_TASK_PAGE_SIZE,
+)
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 
 type JsonObject = dict[str, JsonValue]
@@ -114,6 +119,27 @@ class TaskStatusResponse(_ApiSchema):
 
     id: UUID4
     status: TaskStatus
+
+
+class TaskListParameters(_ApiSchema):
+    """Filtering and pagination accepted by the task list endpoint."""
+
+    status: TaskStatus | None = Field(default=None, description="Filter by exact task status.")
+    priority: TaskPriority | None = Field(
+        default=None,
+        description="Filter by exact task priority.",
+    )
+    page: int = Field(
+        default=DEFAULT_TASK_PAGE,
+        ge=1,
+        description="One-based page number.",
+    )
+    size: int = Field(
+        default=DEFAULT_TASK_PAGE_SIZE,
+        ge=1,
+        le=MAX_TASK_PAGE_SIZE,
+        description="Maximum number of tasks per page.",
+    )
 
 
 class TaskListResponse(_ApiSchema):

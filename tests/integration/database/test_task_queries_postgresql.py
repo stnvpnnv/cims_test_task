@@ -12,10 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Executable, Select
 
 from cims_task_service.application.task_creation import CreateTaskCommand, create_task
+from cims_task_service.application.task_errors import TaskNotFoundError
 from cims_task_service.application.task_queries import (
     ListTasksQuery,
     ListTasksResult,
-    TaskNotFoundError,
     get_task,
     get_task_status,
     list_tasks,

@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from cims_task_service.api import dependencies as api_dependencies
-from cims_task_service.application.task_queries import TaskNotFoundError
+from cims_task_service.application.task_errors import TaskNotFoundError
 from cims_task_service.config import Settings
 from cims_task_service.domain.task import TaskStatus
 from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot

@@ -7,10 +7,12 @@ from fastapi.responses import JSONResponse
 from pydantic import UUID4
 
 from cims_task_service.api.dependencies import (
+    TaskCanceller,
     TaskCreator,
     TaskListReader,
     TaskReader,
     TaskStatusReader,
+    get_task_canceller,
     get_task_creator,
     get_task_list_reader,
     get_task_reader,
@@ -28,7 +30,11 @@ from cims_task_service.application.task_creation import (
     CreateTaskCommand,
     IdempotencyKeyConflictError,
 )
-from cims_task_service.application.task_queries import ListTasksQuery, TaskNotFoundError
+from cims_task_service.application.task_errors import (
+    TaskNotCancellableError,
+    TaskNotFoundError,
+)
+from cims_task_service.application.task_queries import ListTasksQuery
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -44,6 +50,12 @@ _TASK_NOT_FOUND = ProblemDetails(
     title="Task not found",
     status=status.HTTP_404_NOT_FOUND,
     detail="The requested task does not exist.",
+)
+_TASK_NOT_CANCELLABLE = ProblemDetails(
+    type="urn:cims-task-service:problem:task-not-cancellable",
+    title="Task cannot be cancelled",
+    status=status.HTTP_409_CONFLICT,
+    detail="A completed or failed task cannot be cancelled.",
 )
 _LOCATION_HEADER: Final[dict[str, object]] = {
     "description": "Relative URI of the created or replayed task resource.",
@@ -177,6 +189,46 @@ async def list_tasks(
         page=result.page,
         size=result.size,
     )
+
+
+@router.delete(
+    "/{task_id}",
+    name="cancel_task",
+    response_model=TaskResponse,
+    summary="Cancel a task",
+    responses={
+        status.HTTP_404_NOT_FOUND: {
+            "description": "No task exists with the supplied identifier.",
+            "content": {
+                "application/problem+json": {
+                    "schema": ProblemDetails.model_json_schema(),
+                }
+            },
+        },
+        status.HTTP_409_CONFLICT: {
+            "description": "The task already has a completed or failed outcome.",
+            "content": {
+                "application/problem+json": {
+                    "schema": ProblemDetails.model_json_schema(),
+                }
+            },
+        },
+    },
+)
+async def cancel_task(
+    task_id: UUID4,
+    task_canceller: Annotated[TaskCanceller, Depends(get_task_canceller)],
+) -> TaskResponse | JSONResponse:
+    """Persist cancellation and return its current public representation."""
+
+    try:
+        task = await task_canceller(task_id)
+    except TaskNotFoundError:
+        return _problem_response(_TASK_NOT_FOUND)
+    except TaskNotCancellableError:
+        return _problem_response(_TASK_NOT_CANCELLABLE)
+
+    return TaskResponse.model_validate(task, from_attributes=True)
 
 
 @router.get(

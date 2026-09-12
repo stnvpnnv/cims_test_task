@@ -1,18 +1,24 @@
 """Persistence operations for task aggregates and their outbox events."""
 
 from dataclasses import dataclass
+from typing import Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.sql.elements import ColumnElement
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
+from cims_task_service.domain.task_lifecycle import can_transition
 from cims_task_service.infrastructure.database.models import (
     OutboxEventModel,
     TaskModel,
+)
+
+_CANCELLABLE_TASK_STATUSES: Final[tuple[TaskStatus, ...]] = tuple(
+    task_status for task_status in TaskStatus if can_transition(task_status, TaskStatus.CANCELLED)
 )
 
 
@@ -38,6 +44,14 @@ class StoredTaskCreation:
 
     task: TaskModel
     created: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTaskCancellation:
+    """Current task together with whether this call cancelled it."""
+
+    task: TaskModel
+    changed: bool
 
 
 class TaskRepository:
@@ -107,6 +121,62 @@ class TaskRepository:
         )
         items = tuple((await self._session.scalars(page_statement)).all())
         return StoredTaskPage(items=items, total=total)
+
+    async def cancel_with_outbox(
+        self,
+        task_id: UUID,
+        *,
+        event_type: str,
+    ) -> StoredTaskCancellation | None:
+        """Atomically cancel an active task and discard unpublished execution events."""
+
+        cancel_statement = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task_id,
+                TaskModel.status.in_(_CANCELLABLE_TASK_STATUSES),
+            )
+            .values(
+                status=TaskStatus.CANCELLED,
+                finished_at=func.clock_timestamp(),
+                result=None,
+                error=None,
+                dispatch_token=None,
+                execution_token=None,
+                lease_expires_at=None,
+            )
+            .returning(TaskModel)
+            .execution_options(populate_existing=True)
+        )
+        cancelled_task = (await self._session.scalars(cancel_statement)).one_or_none()
+        if cancelled_task is not None:
+            discard_statement = (
+                update(OutboxEventModel)
+                .where(
+                    OutboxEventModel.task_id == task_id,
+                    OutboxEventModel.event_type == event_type,
+                    OutboxEventModel.published_at.is_(None),
+                    OutboxEventModel.discarded_at.is_(None),
+                )
+                .values(
+                    discarded_at=func.clock_timestamp(),
+                    publisher_token=None,
+                    lease_expires_at=None,
+                )
+            )
+            await self._session.execute(discard_statement)
+            return StoredTaskCancellation(task=cancelled_task, changed=True)
+
+        current_task_statement = (
+            select(TaskModel)
+            .where(TaskModel.id == task_id)
+            .execution_options(populate_existing=True)
+        )
+        current_task = (await self._session.scalars(current_task_statement)).one_or_none()
+        if current_task is None:
+            return None
+
+        return StoredTaskCancellation(task=current_task, changed=False)
 
     async def create_with_outbox(
         self,

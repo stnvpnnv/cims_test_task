@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import Depends, Request
 
+from cims_task_service.application.task_cancellation import cancel_task
 from cims_task_service.application.task_creation import (
     CreateTaskCommand,
     CreateTaskResult,
@@ -24,6 +25,7 @@ from cims_task_service.infrastructure.database.session import AsyncSessionFactor
 from cims_task_service.infrastructure.database.task_repository import TaskStatusSnapshot
 
 type TaskCreator = Callable[[CreateTaskCommand], Awaitable[CreateTaskResult]]
+type TaskCanceller = Callable[[UUID], Awaitable[TaskModel]]
 type TaskReader = Callable[[UUID], Awaitable[TaskModel]]
 type TaskStatusReader = Callable[[UUID], Awaitable[TaskStatusSnapshot]]
 type TaskListReader = Callable[[ListTasksQuery], Awaitable[ListTasksResult]]
@@ -56,6 +58,20 @@ def get_task_creator(
         )
 
     return create
+
+
+def get_task_canceller(
+    resources: Annotated[ApplicationResources, Depends(get_application_resources)],
+) -> TaskCanceller:
+    """Bind task cancellation to this application's transactional resources."""
+
+    async def cancel(task_id: UUID) -> TaskModel:
+        return await cancel_task(
+            task_id,
+            session_factory=resources.session_factory,
+        )
+
+    return cancel
 
 
 def get_task_reader(

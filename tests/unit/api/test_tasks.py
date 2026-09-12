@@ -14,7 +14,7 @@ from cims_task_service.application.task_creation import (
     CreateTaskResult,
     IdempotencyKeyConflictError,
 )
-from cims_task_service.application.task_queries import TaskNotFoundError
+from cims_task_service.application.task_errors import TaskNotFoundError
 from cims_task_service.config import Settings
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database.models import TaskModel

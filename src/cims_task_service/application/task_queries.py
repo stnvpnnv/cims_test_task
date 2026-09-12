@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Final
 from uuid import UUID
 
+from cims_task_service.application.task_errors import TaskNotFoundError
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
@@ -50,14 +51,6 @@ class ListTasksResult:
     total: int
     page: int
     size: int
-
-
-class TaskNotFoundError(LookupError):
-    """Raised when a requested task does not exist."""
-
-    def __init__(self, task_id: UUID) -> None:
-        self.task_id = task_id
-        super().__init__(f"Task {task_id} was not found")
 
 
 async def get_task(

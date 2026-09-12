@@ -10,13 +10,13 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.application import task_queries as task_queries_module
+from cims_task_service.application.task_errors import TaskNotFoundError
 from cims_task_service.application.task_queries import (
     DEFAULT_TASK_PAGE,
     DEFAULT_TASK_PAGE_SIZE,
     MAX_TASK_PAGE_SIZE,
     ListTasksQuery,
     ListTasksResult,
-    TaskNotFoundError,
     get_task,
     get_task_status,
     list_tasks,

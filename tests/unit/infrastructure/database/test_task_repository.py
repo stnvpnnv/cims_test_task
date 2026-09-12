@@ -17,6 +17,7 @@ from cims_task_service.infrastructure.database.models import (
     TaskModel,
 )
 from cims_task_service.infrastructure.database.task_repository import (
+    StoredTaskCancellation,
     StoredTaskCreation,
     StoredTaskPage,
     TaskRepository,
@@ -285,6 +286,150 @@ async def test_list_page_skips_the_page_query_when_offset_is_out_of_range() -> N
         "status_1": TaskStatus.COMPLETED,
         "priority_1": TaskPriority.LOW,
     }
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_task_uses_atomic_transition_and_discards_execution_event(
+    inserted_task: TaskModel,
+) -> None:
+    """Cancellation clears fencing state and suppresses unpublished execution work."""
+
+    inserted_task.status = TaskStatus.CANCELLED
+    inserted_task.finished_at = datetime(2026, 9, 5, 1, 3, tzinfo=UTC)
+    inserted_task.dispatch_token = None
+    scalars = AsyncMock(return_value=_ScalarResult(one_or_none=inserted_task))
+    execute = AsyncMock()
+    begin = Mock()
+    commit = AsyncMock()
+    rollback = AsyncMock()
+    session = cast(
+        AsyncSession,
+        Mock(
+            scalars=scalars,
+            execute=execute,
+            begin=begin,
+            commit=commit,
+            rollback=rollback,
+        ),
+    )
+
+    stored = await TaskRepository(session).cancel_with_outbox(
+        inserted_task.id,
+        event_type="task.execute.v1",
+    )
+
+    assert stored == StoredTaskCancellation(task=inserted_task, changed=True)
+    scalars.assert_awaited_once()
+    assert scalars.await_args is not None
+    cancel_statement = scalars.await_args.args[0]
+    cancel_sql = _compiled_sql(cancel_statement)
+    assert cancel_sql.startswith("UPDATE tasks SET status=")
+    assert "finished_at=clock_timestamp()" in cancel_sql
+    assert "WHERE tasks.id =" in cancel_sql
+    assert "tasks.status IN (__[POSTCOMPILE_status_1])" in cancel_sql
+    assert "RETURNING tasks.id, tasks.name, tasks.description" in cancel_sql
+    assert cancel_statement.get_execution_options()["populate_existing"] is True
+
+    cancel_parameters = _compiled_parameters(cancel_statement)
+    assert cancel_parameters["id_1"] == inserted_task.id
+    assert cancel_parameters["status"] is TaskStatus.CANCELLED
+    cancellable_statuses = cast(tuple[TaskStatus, ...], cancel_parameters["status_1"])
+    assert set(cancellable_statuses) == {
+        TaskStatus.NEW,
+        TaskStatus.PENDING,
+        TaskStatus.IN_PROGRESS,
+    }
+    for cleared_column in (
+        "result",
+        "error",
+        "dispatch_token",
+        "execution_token",
+        "lease_expires_at",
+    ):
+        assert cancel_parameters[cleared_column] is None
+
+    execute.assert_awaited_once()
+    assert execute.await_args is not None
+    discard_statement = execute.await_args.args[0]
+    discard_sql = _compiled_sql(discard_statement)
+    assert discard_sql.startswith("UPDATE outbox_events SET discarded_at=clock_timestamp()")
+    assert "publisher_token=" in discard_sql
+    assert "lease_expires_at=" in discard_sql
+    assert "outbox_events.task_id =" in discard_sql
+    assert "outbox_events.event_type =" in discard_sql
+    assert "outbox_events.published_at IS NULL" in discard_sql
+    assert "outbox_events.discarded_at IS NULL" in discard_sql
+    discard_parameters = _compiled_parameters(discard_statement)
+    assert inserted_task.id in discard_parameters.values()
+    assert "task.execute.v1" in discard_parameters.values()
+    assert discard_parameters["publisher_token"] is None
+    assert discard_parameters["lease_expires_at"] is None
+
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "current_status",
+    [TaskStatus.CANCELLED, TaskStatus.COMPLETED, TaskStatus.FAILED],
+)
+@pytest.mark.asyncio
+async def test_cancel_returns_unchanged_terminal_task_without_touching_outbox(
+    inserted_task: TaskModel,
+    current_status: TaskStatus,
+) -> None:
+    """A failed compare-and-set exposes the fresh state for application decisions."""
+
+    inserted_task.status = current_status
+    scalars = AsyncMock(
+        side_effect=[
+            _ScalarResult(one_or_none=None),
+            _ScalarResult(one_or_none=inserted_task),
+        ]
+    )
+    execute = AsyncMock()
+    session = cast(AsyncSession, Mock(scalars=scalars, execute=execute))
+
+    stored = await TaskRepository(session).cancel_with_outbox(
+        inserted_task.id,
+        event_type="task.execute.v1",
+    )
+
+    assert stored == StoredTaskCancellation(task=inserted_task, changed=False)
+    assert scalars.await_count == 2
+    current_task_statement = scalars.await_args_list[1].args[0]
+    current_task_sql = _compiled_sql(current_task_statement)
+    assert current_task_sql.startswith("SELECT tasks.id, tasks.name, tasks.description")
+    assert "FROM tasks WHERE tasks.id =" in current_task_sql
+    assert " FOR UPDATE" not in current_task_sql
+    assert current_task_statement.get_execution_options()["populate_existing"] is True
+    assert _compiled_parameters(current_task_statement) == {"id_1": inserted_task.id}
+    execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_returns_none_when_task_does_not_exist() -> None:
+    """An unknown identifier remains distinguishable from terminal task states."""
+
+    task_id = UUID("ba21a692-6c11-47ac-bc71-392f27f03416")
+    scalars = AsyncMock(
+        side_effect=[
+            _ScalarResult(one_or_none=None),
+            _ScalarResult(one_or_none=None),
+        ]
+    )
+    execute = AsyncMock()
+    session = cast(AsyncSession, Mock(scalars=scalars, execute=execute))
+
+    stored = await TaskRepository(session).cancel_with_outbox(
+        task_id,
+        event_type="task.execute.v1",
+    )
+
+    assert stored is None
+    assert scalars.await_count == 2
+    execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -585,3 +730,12 @@ def test_stored_creation_is_immutable(inserted_task: TaskModel) -> None:
 
     with pytest.raises(FrozenInstanceError):
         outcome.__setattr__("created", False)
+
+
+def test_stored_cancellation_is_immutable(inserted_task: TaskModel) -> None:
+    """Cancellation outcome cannot lose its compare-and-set result."""
+
+    outcome = StoredTaskCancellation(task=inserted_task, changed=True)
+
+    with pytest.raises(FrozenInstanceError):
+        outcome.__setattr__("changed", False)

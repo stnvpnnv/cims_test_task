@@ -1,11 +1,11 @@
-"""Tests for one-batch task outbox dispatch orchestration."""
+"""Tests for task outbox publication orchestration."""
 
 import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace, TracebackType
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import AsyncMock, Mock, call
 from uuid import UUID
 
@@ -19,6 +19,7 @@ from cims_task_service.application.task_dispatcher import (
     TaskEventPublisher,
     TaskOutboxDispatcher,
     calculate_publish_retry_delay,
+    run_dispatcher_loop,
     summarize_publication_failure,
 )
 from cims_task_service.infrastructure.database.outbox_repository import ClaimedOutboxEvent
@@ -43,6 +44,18 @@ class _DispatcherHarness:
     publish: AsyncMock
     mark_published: AsyncMock
     reschedule: AsyncMock
+
+
+class _ObservedStopEvent(asyncio.Event):
+    """Event double exposing when the production idle wait has started."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_started = asyncio.Event()
+
+    async def wait(self) -> Literal[True]:
+        self.wait_started.set()
+        return await super().wait()
 
 
 def _event(index: int, *, publish_attempts: int = 1) -> ClaimedOutboxEvent:
@@ -778,3 +791,421 @@ async def test_multiple_finalization_failures_are_reported_together(
     assert error_info.value.exceptions == failures
     assert harness.mark_published.await_count == 2
     harness.reschedule.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "poll_interval_seconds",
+    [0.0, -0.1, float("inf"), float("-inf"), float("nan")],
+)
+@pytest.mark.asyncio
+async def test_dispatcher_loop_rejects_an_invalid_poll_interval(
+    poll_interval_seconds: float,
+) -> None:
+    """An invalid idle policy fails before the first database-backed pass."""
+
+    dispatch_once = AsyncMock()
+
+    with pytest.raises(
+        ValueError,
+        match=r"^poll_interval_seconds must be finite and positive$",
+    ):
+        await run_dispatcher_loop(
+            dispatch_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    dispatch_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_loop_does_not_claim_when_already_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pre-set stop event prevents all database and idle-wait work."""
+
+    stop_event = asyncio.Event()
+    stop_event.set()
+    dispatch_once = AsyncMock()
+    idle_wait = AsyncMock()
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+
+    await run_dispatcher_loop(
+        dispatch_once,
+        stop_event=stop_event,
+        poll_interval_seconds=0.25,
+    )
+
+    dispatch_once.assert_not_awaited()
+    idle_wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_loop_drains_ready_batches_before_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-empty batches trigger immediate passes until the outbox becomes idle."""
+
+    stop_event = asyncio.Event()
+    idle_wait_started = asyncio.Event()
+    non_empty = DispatchBatchResult(1, 1, 0, 0)
+    empty = DispatchBatchResult(0, 0, 0, 0)
+    dispatch_once = AsyncMock(side_effect=(non_empty, non_empty, empty))
+
+    async def wait_until_stopped(
+        received_stop_event: asyncio.Event,
+        *,
+        poll_interval_seconds: float,
+    ) -> None:
+        assert received_stop_event is stop_event
+        assert poll_interval_seconds == 0.25
+        idle_wait_started.set()
+        await received_stop_event.wait()
+
+    idle_wait = AsyncMock(side_effect=wait_until_stopped)
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=0.25,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await idle_wait_started.wait()
+            assert dispatch_once.await_count == 3
+            idle_wait.assert_awaited_once()
+            stop_event.set()
+            await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        stop_event.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    assert dispatch_once.await_count == 3
+    idle_wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_loop_repolls_only_after_the_idle_wait_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An idle timeout schedules one new pass without creating a busy loop."""
+
+    stop_event = asyncio.Event()
+    first_wait_started = asyncio.Event()
+    expire_first_wait = asyncio.Event()
+    second_wait_started = asyncio.Event()
+    empty = DispatchBatchResult(0, 0, 0, 0)
+    dispatch_once = AsyncMock(return_value=empty)
+    wait_number = 0
+
+    async def simulate_idle_wait(
+        received_stop_event: asyncio.Event,
+        *,
+        poll_interval_seconds: float,
+    ) -> None:
+        nonlocal wait_number
+        assert received_stop_event is stop_event
+        assert poll_interval_seconds == 0.5
+        wait_number += 1
+        if wait_number == 1:
+            first_wait_started.set()
+            await expire_first_wait.wait()
+            return
+        second_wait_started.set()
+        await received_stop_event.wait()
+
+    idle_wait = AsyncMock(side_effect=simulate_idle_wait)
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=0.5,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await first_wait_started.wait()
+            assert dispatch_once.await_count == 1
+            expire_first_wait.set()
+            await second_wait_started.wait()
+            assert dispatch_once.await_count == 2
+            stop_event.set()
+            await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        expire_first_wait.set()
+        stop_event.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    assert dispatch_once.await_count == 2
+    assert idle_wait.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_event_wakes_the_production_idle_wait() -> None:
+    """Graceful shutdown does not wait for the configured polling deadline."""
+
+    stop_event = _ObservedStopEvent()
+    dispatch_once = AsyncMock(return_value=DispatchBatchResult(0, 0, 0, 0))
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=60.0,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await stop_event.wait_started.wait()
+            stop_event.set()
+            await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        stop_event.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    dispatch_once.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_production_idle_deadline_triggers_the_next_poll() -> None:
+    """The real deadline resumes polling without relying on an elapsed-time assertion."""
+
+    stop_event = asyncio.Event()
+    empty = DispatchBatchResult(0, 0, 0, 0)
+    call_count = 0
+
+    def dispatch_batch() -> DispatchBatchResult:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            stop_event.set()
+        return empty
+
+    dispatch_once = AsyncMock(side_effect=dispatch_batch)
+    safety_timeout = asyncio.timeout(1)
+
+    async with safety_timeout:
+        await run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=0.001,
+        )
+
+    assert safety_timeout.expired() is False
+    assert dispatch_once.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_idle_wait_does_not_swallow_an_unrelated_timeout() -> None:
+    """Only expiration of the helper's own deadline is an expected idle tick."""
+
+    expected_error = TimeoutError("event wait failed")
+    wait = AsyncMock(side_effect=expected_error)
+    stop_event = cast(asyncio.Event, SimpleNamespace(wait=wait))
+
+    with pytest.raises(TimeoutError, match=r"^event wait failed$") as error_info:
+        await task_dispatcher_module._wait_for_stop(
+            stop_event,
+            poll_interval_seconds=60.0,
+        )
+
+    assert error_info.value is expected_error
+    wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_active_batch_finishes_it_without_another_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Graceful stop lets the finite in-flight wave settle before returning."""
+
+    stop_event = asyncio.Event()
+    batch_started = asyncio.Event()
+    allow_batch_to_finish = asyncio.Event()
+    batch_finished = asyncio.Event()
+    batch_cancelled = False
+
+    async def dispatch_batch() -> DispatchBatchResult:
+        nonlocal batch_cancelled
+        batch_started.set()
+        try:
+            await allow_batch_to_finish.wait()
+        except asyncio.CancelledError:
+            batch_cancelled = True
+            raise
+        batch_finished.set()
+        return DispatchBatchResult(1, 1, 0, 0)
+
+    dispatch_once = AsyncMock(side_effect=dispatch_batch)
+    idle_wait = AsyncMock()
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=0.25,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await batch_started.wait()
+            stop_event.set()
+            assert loop_task.done() is False
+            allow_batch_to_finish.set()
+            await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        allow_batch_to_finish.set()
+        stop_event.set()
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    assert batch_finished.is_set() is True
+    assert batch_cancelled is False
+    dispatch_once.assert_awaited_once_with()
+    idle_wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failure_terminates_the_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected infrastructure failures are delegated to the process supervisor."""
+
+    expected_error = OSError("database unavailable")
+    dispatch_once = AsyncMock(side_effect=expected_error)
+    idle_wait = AsyncMock()
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+
+    with pytest.raises(OSError, match=r"^database unavailable$") as error_info:
+        await run_dispatcher_loop(
+            dispatch_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=0.25,
+        )
+
+    assert error_info.value is expected_error
+    dispatch_once.assert_awaited_once_with()
+    idle_wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_timeout_is_not_mistaken_for_an_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database timeout escapes because only stop-event waiting is guarded."""
+
+    expected_error = TimeoutError("database pool timed out")
+    dispatch_once = AsyncMock(side_effect=expected_error)
+    idle_wait = AsyncMock()
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+
+    with pytest.raises(TimeoutError, match=r"^database pool timed out$") as error_info:
+        await run_dispatcher_loop(
+            dispatch_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=0.25,
+        )
+
+    assert error_info.value is expected_error
+    dispatch_once.assert_awaited_once_with()
+    idle_wait.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_an_idle_dispatcher_loop_propagates() -> None:
+    """Forced shutdown crosses the real idle deadline without another pass."""
+
+    stop_event = _ObservedStopEvent()
+    dispatch_once = AsyncMock(return_value=DispatchBatchResult(0, 0, 0, 0))
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=stop_event,
+            poll_interval_seconds=60.0,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await stop_event.wait_started.wait()
+            loop_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    dispatch_once.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_during_an_active_batch_propagates_into_that_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown grace expiry cancels in-flight work without starting another pass."""
+
+    batch_started = asyncio.Event()
+    never_released = asyncio.Event()
+    received_cancellation: asyncio.CancelledError | None = None
+
+    async def dispatch_batch() -> DispatchBatchResult:
+        nonlocal received_cancellation
+        batch_started.set()
+        try:
+            await never_released.wait()
+        except asyncio.CancelledError as error:
+            received_cancellation = error
+            raise
+        return DispatchBatchResult(1, 1, 0, 0)
+
+    dispatch_once = AsyncMock(side_effect=dispatch_batch)
+    idle_wait = AsyncMock()
+    monkeypatch.setattr(task_dispatcher_module, "_wait_for_stop", idle_wait)
+    loop_task = asyncio.create_task(
+        run_dispatcher_loop(
+            dispatch_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=0.25,
+        )
+    )
+
+    try:
+        safety_timeout = asyncio.timeout(1)
+        async with safety_timeout:
+            await batch_started.wait()
+            loop_task.cancel()
+            with pytest.raises(asyncio.CancelledError) as error_info:
+                await loop_task
+        assert safety_timeout.expired() is False
+    finally:
+        if not loop_task.done():
+            loop_task.cancel()
+        await asyncio.gather(loop_task, return_exceptions=True)
+
+    assert received_cancellation is error_info.value
+    dispatch_once.assert_awaited_once_with()
+    idle_wait.assert_not_awaited()

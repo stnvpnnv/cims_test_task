@@ -1,7 +1,7 @@
-"""One-batch orchestration for reliable task outbox publication."""
+"""Reliable task outbox publication orchestration."""
 
 import asyncio
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum
@@ -39,6 +39,9 @@ class DispatchBatchResult:
     published: int
     rescheduled: int
     lost_ownership: int
+
+
+type DispatchOnce = Callable[[], Awaitable[DispatchBatchResult]]
 
 
 class _DispatchOutcome(Enum):
@@ -221,6 +224,29 @@ class TaskOutboxDispatcher:
         return rescheduled
 
 
+async def run_dispatcher_loop(
+    dispatch_once: DispatchOnce,
+    *,
+    stop_event: asyncio.Event,
+    poll_interval_seconds: float,
+) -> None:
+    """Drain ready batches and wait interruptibly whenever the outbox is idle."""
+
+    if not isfinite(poll_interval_seconds) or poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be finite and positive")
+
+    while not stop_event.is_set():
+        result = await dispatch_once()
+        if stop_event.is_set():
+            return
+        if result.claimed > 0:
+            continue
+        await _wait_for_stop(
+            stop_event,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+
 def _equal_jitter_factor() -> float:
     return _SYSTEM_RANDOM.uniform(_MINIMUM_JITTER_FACTOR, _MAXIMUM_JITTER_FACTOR)
 
@@ -229,6 +255,20 @@ def _timedelta_microseconds(value: timedelta) -> int:
     return (
         value.days * _SECONDS_PER_DAY + value.seconds
     ) * _MICROSECONDS_PER_SECOND + value.microseconds
+
+
+async def _wait_for_stop(
+    stop_event: asyncio.Event,
+    *,
+    poll_interval_seconds: float,
+) -> None:
+    idle_timeout = asyncio.timeout(poll_interval_seconds)
+    try:
+        async with idle_timeout:
+            await stop_event.wait()
+    except TimeoutError:
+        if not idle_timeout.expired():
+            raise
 
 
 def _unwrap_dispatch_outcomes(

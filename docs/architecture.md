@@ -62,6 +62,13 @@ NEW / PENDING / IN_PROGRESS → CANCELLED
 Dispatcher использует lease и publisher confirms. Worker подтверждает
 сообщение только после фиксации результата в БД.
 
+Publisher отправляет persistent-сообщение как mandatory и считает публикацию
+успешной только после подтверждения RabbitMQ; `Basic.Return` является ошибкой.
+`message_id` равен UUID outbox-события, `correlation_id` — UUID задачи и не меняются
+при повторной публикации. Это позволяет consumer'у дедуплицировать сообщения, но
+не превращает at-least-once в exactly-once. Publisher отвечает только за broker I/O;
+lease, фиксация `published_at` и планирование retry принадлежат dispatcher'у.
+
 Основной путь доставки имеет гарантию at-least-once. Дубликаты обрабатываются
 идемпотентно, а execution token не позволяет старому worker записать
 поздний результат. Просроченный lease возвращает зависшую задачу в очередь.

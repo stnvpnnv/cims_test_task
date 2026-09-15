@@ -1,9 +1,11 @@
 """Runtime configuration loaded from environment variables."""
 
-from typing import Annotated
+from datetime import timedelta
+from typing import Annotated, Self
 
 from pydantic import (
     AnyUrl,
+    Field,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -12,6 +14,7 @@ from pydantic import (
     UrlConstraints,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import make_url
@@ -77,3 +80,55 @@ class Settings(BaseSettings):
             message = "RabbitMQ URL must be a valid amqp or amqps URL with a host"
             raise ValueError(message) from None
         return SecretStr(str(rabbitmq_url))
+
+
+class DispatcherSettings(Settings):
+    """Settings used only by the independently deployed dispatcher process."""
+
+    dispatcher_batch_size: Annotated[int, Field(ge=1, le=100)] = 10
+    dispatcher_poll_interval_seconds: PositiveFloat = 0.5
+    dispatcher_lease_duration_seconds: PositiveFloat = 60.0
+    dispatcher_retry_initial_delay_seconds: PositiveFloat = 1.0
+    dispatcher_retry_maximum_delay_seconds: PositiveFloat = 60.0
+    rabbitmq_publish_timeout_seconds: PositiveFloat = 10.0
+    dispatcher_shutdown_grace_seconds: PositiveFloat = 45.0
+
+    @model_validator(mode="after")
+    def require_coherent_dispatcher_policy(self) -> Self:
+        """Reject invalid dispatcher resource and timer relationships."""
+
+        try:
+            retry_initial_delay = timedelta(seconds=self.dispatcher_retry_initial_delay_seconds)
+            retry_maximum_delay = timedelta(seconds=self.dispatcher_retry_maximum_delay_seconds)
+            lease_duration = timedelta(seconds=self.dispatcher_lease_duration_seconds)
+            required_lease_duration = timedelta(
+                seconds=(self.rabbitmq_publish_timeout_seconds + self.database_pool_timeout_seconds)
+            )
+        except OverflowError as error:
+            message = "dispatcher durations must fit within Python timedelta range"
+            raise ValueError(message) from error
+
+        if (
+            retry_initial_delay <= timedelta(0)
+            or retry_maximum_delay <= timedelta(0)
+            or lease_duration <= timedelta(0)
+        ):
+            message = (
+                "dispatcher lease and retry durations must resolve to at least one microsecond"
+            )
+            raise ValueError(message)
+
+        if retry_maximum_delay < retry_initial_delay:
+            message = "dispatcher retry maximum delay must be at least its initial delay"
+            raise ValueError(message)
+
+        database_pool_capacity = self.database_pool_size + self.database_max_overflow
+        if self.dispatcher_batch_size > database_pool_capacity:
+            message = "dispatcher batch size must not exceed database pool capacity"
+            raise ValueError(message)
+
+        if lease_duration <= required_lease_duration:
+            message = "dispatcher lease duration must exceed the publish and database pool timeouts"
+            raise ValueError(message)
+
+        return self

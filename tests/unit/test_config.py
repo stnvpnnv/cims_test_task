@@ -3,7 +3,17 @@
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from cims_task_service.config import Settings
+from cims_task_service.application.task_dispatcher import MAX_DISPATCH_BATCH_SIZE
+from cims_task_service.config import DispatcherSettings, Settings
+
+_DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
+    "CIMS_DISPATCHER_POLL_INTERVAL_SECONDS",
+    "CIMS_DISPATCHER_LEASE_DURATION_SECONDS",
+    "CIMS_DISPATCHER_RETRY_INITIAL_DELAY_SECONDS",
+    "CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS",
+    "CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS",
+    "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
+)
 
 _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_DEBUG",
@@ -16,6 +26,8 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_RABBITMQ_URL",
     "CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS",
     "CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS",
+    "CIMS_DISPATCHER_BATCH_SIZE",
+    *_DISPATCHER_DURATION_ENVIRONMENT_VARIABLES,
 )
 
 
@@ -81,6 +93,88 @@ def test_settings_load_environment_overrides(
     )
     assert settings.rabbitmq_connection_timeout_seconds == 12.5
     assert settings.rabbitmq_reconnect_interval_seconds == 2.5
+
+
+def test_dispatcher_settings_have_coherent_defaults() -> None:
+    """Defaults leave operational headroom for publishing and finalization."""
+
+    settings = DispatcherSettings()
+
+    assert settings.dispatcher_batch_size == 10
+    assert settings.dispatcher_poll_interval_seconds == 0.5
+    assert settings.dispatcher_lease_duration_seconds == 60.0
+    assert settings.dispatcher_retry_initial_delay_seconds == 1.0
+    assert settings.dispatcher_retry_maximum_delay_seconds == 60.0
+    assert settings.rabbitmq_publish_timeout_seconds == 10.0
+    assert settings.dispatcher_shutdown_grace_seconds == 45.0
+
+
+def test_dispatcher_settings_load_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dedicated process receives typed deployment-specific values."""
+
+    monkeypatch.setenv("CIMS_DISPATCHER_BATCH_SIZE", "12")
+    monkeypatch.setenv("CIMS_DISPATCHER_POLL_INTERVAL_SECONDS", "0.25")
+    monkeypatch.setenv("CIMS_DISPATCHER_LEASE_DURATION_SECONDS", "45")
+    monkeypatch.setenv("CIMS_DISPATCHER_RETRY_INITIAL_DELAY_SECONDS", "1.5")
+    monkeypatch.setenv("CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS", "90")
+    monkeypatch.setenv("CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS", "12")
+    monkeypatch.setenv("CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS", "20")
+
+    settings = DispatcherSettings()
+
+    assert settings.dispatcher_batch_size == 12
+    assert settings.dispatcher_poll_interval_seconds == 0.25
+    assert settings.dispatcher_lease_duration_seconds == 45.0
+    assert settings.dispatcher_retry_initial_delay_seconds == 1.5
+    assert settings.dispatcher_retry_maximum_delay_seconds == 90.0
+    assert settings.rabbitmq_publish_timeout_seconds == 12.0
+    assert settings.dispatcher_shutdown_grace_seconds == 20.0
+
+
+@pytest.mark.parametrize(
+    ("variable_name", "attribute_name"),
+    [
+        ("CIMS_DISPATCHER_BATCH_SIZE", "dispatcher_batch_size"),
+        (
+            "CIMS_DISPATCHER_POLL_INTERVAL_SECONDS",
+            "dispatcher_poll_interval_seconds",
+        ),
+        (
+            "CIMS_DISPATCHER_LEASE_DURATION_SECONDS",
+            "dispatcher_lease_duration_seconds",
+        ),
+        (
+            "CIMS_DISPATCHER_RETRY_INITIAL_DELAY_SECONDS",
+            "dispatcher_retry_initial_delay_seconds",
+        ),
+        (
+            "CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS",
+            "dispatcher_retry_maximum_delay_seconds",
+        ),
+        (
+            "CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS",
+            "rabbitmq_publish_timeout_seconds",
+        ),
+        (
+            "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
+            "dispatcher_shutdown_grace_seconds",
+        ),
+    ],
+)
+def test_base_settings_ignore_dispatcher_only_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    attribute_name: str,
+) -> None:
+    """An API process is not rejected by settings it never consumes."""
+
+    monkeypatch.setenv(variable_name, "not-a-valid-value")
+
+    settings = Settings()
+
+    assert not hasattr(settings, attribute_name)
 
 
 def test_rabbitmq_settings_accept_tls_and_encoded_vhost(
@@ -233,3 +327,175 @@ def test_settings_reject_invalid_operational_values(
 
     with pytest.raises(ValidationError):
         Settings()
+
+
+@pytest.mark.parametrize("batch_size", [1, MAX_DISPATCH_BATCH_SIZE])
+def test_dispatcher_batch_size_accepts_core_boundaries(batch_size: int) -> None:
+    """Configuration and dispatcher resource limits remain synchronized."""
+
+    settings = DispatcherSettings(
+        dispatcher_batch_size=batch_size,
+        database_pool_size=batch_size,
+        database_max_overflow=0,
+    )
+
+    assert settings.dispatcher_batch_size == batch_size
+
+
+@pytest.mark.parametrize(
+    "invalid_batch_size",
+    ["0", "-1", "1.5", str(MAX_DISPATCH_BATCH_SIZE + 1)],
+)
+def test_dispatcher_batch_size_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_batch_size: str,
+) -> None:
+    """Invalid or resource-amplifying batch values fail during startup."""
+
+    monkeypatch.setenv("CIMS_DISPATCHER_BATCH_SIZE", invalid_batch_size)
+    monkeypatch.setenv(
+        "CIMS_DATABASE_POOL_SIZE",
+        str(MAX_DISPATCH_BATCH_SIZE + 1),
+    )
+
+    with pytest.raises(ValidationError):
+        DispatcherSettings()
+
+
+@pytest.mark.parametrize("variable_name", _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES)
+@pytest.mark.parametrize("invalid_value", ["0", "-0.1"])
+def test_dispatcher_durations_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """Zero and negative durations cannot reach runtime timeout primitives."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        DispatcherSettings()
+
+
+@pytest.mark.parametrize("variable_name", _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES)
+@pytest.mark.parametrize("invalid_value", ["nan", "inf", "-inf"])
+def test_dispatcher_durations_must_be_finite(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """IEEE special values are rejected before timeout calculations."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        DispatcherSettings()
+
+
+def test_dispatcher_retry_maximum_must_cover_the_initial_delay() -> None:
+    """A capped backoff cannot start above its own maximum."""
+
+    with pytest.raises(
+        ValidationError,
+        match="dispatcher retry maximum delay must be at least its initial delay",
+    ):
+        DispatcherSettings(
+            dispatcher_retry_initial_delay_seconds=2.0,
+            dispatcher_retry_maximum_delay_seconds=1.0,
+        )
+
+
+def test_dispatcher_retry_delay_allows_a_fixed_cap() -> None:
+    """Equal initial and maximum values intentionally produce jitter-only retry."""
+
+    settings = DispatcherSettings(
+        dispatcher_retry_initial_delay_seconds=2.0,
+        dispatcher_retry_maximum_delay_seconds=2.0,
+    )
+
+    assert settings.dispatcher_retry_maximum_delay_seconds == 2.0
+
+
+def test_dispatcher_batch_must_fit_the_database_pool() -> None:
+    """Every event in a finalization wave must be able to acquire a connection."""
+
+    with pytest.raises(
+        ValidationError,
+        match="dispatcher batch size must not exceed database pool capacity",
+    ):
+        DispatcherSettings(
+            dispatcher_batch_size=3,
+            database_pool_size=1,
+            database_max_overflow=1,
+        )
+
+
+@pytest.mark.parametrize("lease_duration", [40.0, 39.9, 40.0000004])
+def test_dispatcher_lease_must_exceed_publish_and_pool_timeouts(
+    lease_duration: float,
+) -> None:
+    """A normal publish and connection wait cannot guarantee an expired lease."""
+
+    with pytest.raises(
+        ValidationError,
+        match="dispatcher lease duration must exceed the publish and database pool timeouts",
+    ):
+        DispatcherSettings(
+            dispatcher_lease_duration_seconds=lease_duration,
+            rabbitmq_publish_timeout_seconds=10.0,
+            database_pool_timeout_seconds=30.0,
+        )
+
+
+def test_dispatcher_lease_accepts_a_duration_above_required_timeouts() -> None:
+    """Strictly greater lease duration satisfies the finalization headroom rule."""
+
+    settings = DispatcherSettings(
+        dispatcher_lease_duration_seconds=40.000001,
+        rabbitmq_publish_timeout_seconds=10.0,
+        database_pool_timeout_seconds=30.0,
+    )
+
+    assert settings.dispatcher_lease_duration_seconds == 40.000001
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "dispatcher_lease_duration_seconds",
+        "dispatcher_retry_initial_delay_seconds",
+        "dispatcher_retry_maximum_delay_seconds",
+    ],
+)
+def test_dispatcher_rejects_durations_that_round_to_zero(
+    field_name: str,
+) -> None:
+    """Validated durations remain positive after conversion to timedelta."""
+
+    with pytest.raises(
+        ValidationError,
+        match=("dispatcher lease and retry durations must resolve to at least one microsecond"),
+    ):
+        DispatcherSettings.model_validate({field_name: 1e-10})
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"dispatcher_lease_duration_seconds": 1e308},
+        {"dispatcher_retry_initial_delay_seconds": 1e308},
+        {"dispatcher_retry_maximum_delay_seconds": 1e308},
+        {"rabbitmq_publish_timeout_seconds": 1e308},
+        {"database_pool_timeout_seconds": 1e308},
+    ],
+)
+def test_dispatcher_rejects_durations_outside_timedelta_range(
+    overrides: dict[str, float],
+) -> None:
+    """Finite deployment values must still be representable by runtime types."""
+
+    with pytest.raises(
+        ValidationError,
+        match="dispatcher durations must fit within Python timedelta range",
+    ):
+        DispatcherSettings.model_validate(overrides)

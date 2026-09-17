@@ -16,6 +16,9 @@ dependencies = [
   "uvicorn[standard]>=0.51.0,<0.52.0",
 ]
 
+[project.scripts]
+cims-task-dispatcher = "cims_task_service.dispatcher:main"
+
 [tool.poetry]
 packages = [{ include = "cims_task_service", from = "src" }]
 

@@ -1,0 +1,14 @@
+**
+
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!poetry.lock
+!README.md
+!src/
+!src/**
+!migrations/
+!migrations/**
+
+**/__pycache__/
+**/*.py[cod]

@@ -286,3 +286,61 @@ async def test_complete_uses_a_fenced_terminal_transition(
     begin.assert_not_called()
     commit.assert_not_awaited()
     rollback.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("stored_task_id", "expected"),
+    [(_TASK_ID, True), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_fail_uses_a_fenced_terminal_transition(
+    stored_task_id: UUID | None,
+    expected: bool,
+) -> None:
+    """An error is persisted only for the current owner, without starting a retry."""
+
+    error: JsonObject = {"code": "PROCESSING_FAILED", "retryable": False}
+    scalar = AsyncMock(return_value=stored_task_id)
+    begin = Mock()
+    commit = AsyncMock()
+    rollback = AsyncMock()
+    session = cast(
+        AsyncSession,
+        Mock(scalar=scalar, begin=begin, commit=commit, rollback=rollback),
+    )
+
+    failed = await TaskExecutionRepository(session).fail_execution(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        error=error,
+    )
+
+    assert failed is expected
+    scalar.assert_awaited_once()
+    assert scalar.await_args is not None
+    statement = scalar.await_args.args[0]
+    sql = _compiled_sql(statement)
+    assert sql.startswith("UPDATE tasks SET status=")
+    assert "finished_at=clock_timestamp()" in sql
+    assert sql.endswith("RETURNING tasks.id")
+    where_sql = sql.split(" WHERE ", maxsplit=1)[1].split(" RETURNING", maxsplit=1)[0]
+    assert "tasks.id =" in where_sql
+    assert "tasks.status =" in where_sql
+    assert "tasks.execution_token =" in where_sql
+    assert "lease_expires_at" not in where_sql
+    assert "clock_timestamp" not in where_sql
+    assert "attempt_count" not in sql
+    assert "max_attempts" not in sql
+    assert "started_at" not in sql
+
+    parameters = _compiled_parameters(statement)
+    assert parameters["status"] is TaskStatus.FAILED
+    assert parameters["status_1"] is TaskStatus.IN_PROGRESS
+    assert parameters["id_1"] == _TASK_ID
+    assert parameters["execution_token_1"] == _EXECUTION_TOKEN
+    assert parameters["error"] == error
+    for cleared_field in ("result", "dispatch_token", "execution_token", "lease_expires_at"):
+        assert parameters[cleared_field] is None
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()

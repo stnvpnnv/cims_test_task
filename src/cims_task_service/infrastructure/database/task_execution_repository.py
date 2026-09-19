@@ -26,7 +26,7 @@ class ClaimedTaskExecution:
 
 
 class TaskExecutionRepository:
-    """Acquire task execution ownership without owning the transaction."""
+    """Acquire and finalize task executions without owning the transaction."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -120,6 +120,35 @@ class TaskExecutionRepository:
                 finished_at=func.clock_timestamp(),
                 result=result,
                 error=None,
+                dispatch_token=None,
+                execution_token=None,
+                lease_expires_at=None,
+            )
+            .returning(TaskModel.id)
+        )
+        return await self._session.scalar(statement) is not None
+
+    async def fail_execution(
+        self,
+        task_id: UUID,
+        *,
+        execution_token: UUID,
+        error: JsonObject,
+    ) -> bool:
+        """Persist a terminal error only for the current execution owner."""
+
+        statement = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task_id,
+                TaskModel.status == TaskStatus.IN_PROGRESS,
+                TaskModel.execution_token == execution_token,
+            )
+            .values(
+                status=TaskStatus.FAILED,
+                finished_at=func.clock_timestamp(),
+                result=None,
+                error=error,
                 dispatch_token=None,
                 execution_token=None,
                 lease_expires_at=None,

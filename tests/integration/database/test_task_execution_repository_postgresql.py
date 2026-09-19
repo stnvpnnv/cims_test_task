@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import timedelta
+from typing import Literal
 from uuid import UUID
 
 import pytest
@@ -27,6 +28,7 @@ _RESULT: JsonObject = {
     "name_length": 20,
     "description_length": 37,
 }
+_ERROR: JsonObject = {"code": "PROCESSING_FAILED", "retryable": False}
 
 
 async def _create_pending_task(
@@ -71,14 +73,22 @@ async def _claim_and_commit(
         )
 
 
-async def _complete_and_commit(
+async def _finalize_and_commit(
     session_factory: AsyncSessionFactory,
     *,
     task_id: UUID,
     execution_token: UUID,
+    outcome: Literal["completion", "failure"],
 ) -> bool:
     async with session_factory.begin() as session:
-        return await TaskExecutionRepository(session).complete_execution(
+        repository = TaskExecutionRepository(session)
+        if outcome == "failure":
+            return await repository.fail_execution(
+                task_id,
+                execution_token=execution_token,
+                error=_ERROR,
+            )
+        return await repository.complete_execution(
             task_id,
             execution_token=execution_token,
             result=_RESULT,
@@ -207,8 +217,10 @@ async def test_current_execution_owner_persists_a_successful_result(
     assert stored.lease_expires_at is None
 
 
-async def test_stale_execution_token_cannot_persist_a_result(
+@pytest.mark.parametrize("outcome", ["completion", "failure"])
+async def test_stale_execution_token_cannot_finalize_an_execution(
     postgres_session_factory: AsyncSessionFactory,
+    outcome: Literal["completion", "failure"],
 ) -> None:
     """A worker without the current fencing token leaves the active attempt unchanged."""
 
@@ -220,14 +232,14 @@ async def test_stale_execution_token_cannot_persist_a_result(
     )
     assert claimed is not None
 
-    async with postgres_session_factory.begin() as session:
-        completed = await TaskExecutionRepository(session).complete_execution(
-            task_id,
-            execution_token=_STALE_EXECUTION_TOKEN,
-            result=_RESULT,
-        )
+    finalized = await _finalize_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        execution_token=_STALE_EXECUTION_TOKEN,
+        outcome=outcome,
+    )
 
-    assert completed is False
+    assert finalized is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
 
@@ -235,16 +247,19 @@ async def test_stale_execution_token_cannot_persist_a_result(
     assert stored.status is TaskStatus.IN_PROGRESS
     assert stored.attempt_count == 1
     assert stored.result is None
+    assert stored.error is None
     assert stored.finished_at is None
     assert stored.execution_token == claimed.execution_token
     assert stored.lease_expires_at == claimed.lease_expires_at
 
 
-async def test_cancellation_fences_a_late_successful_result(
+@pytest.mark.parametrize("outcome", ["completion", "failure"])
+async def test_cancellation_fences_a_late_execution_outcome(
     postgres_engine: AsyncEngine,
     postgres_session_factory: AsyncSessionFactory,
+    outcome: Literal["completion", "failure"],
 ) -> None:
-    """A completion waiting on cancellation rechecks ownership after the lock releases."""
+    """A finalization waiting on cancellation rechecks ownership after the lock releases."""
 
     task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
     claimed = await _claim_and_commit(
@@ -285,10 +300,11 @@ async def test_cancellation_fences_a_late_successful_result(
             expire_on_commit=False,
         )
         waiter = asyncio.create_task(
-            _complete_and_commit(
+            _finalize_and_commit(
                 waiting_factory,
                 task_id=task_id,
                 execution_token=claimed.execution_token,
+                outcome=outcome,
             )
         )
         try:
@@ -297,7 +313,7 @@ async def test_cancellation_fences_a_late_successful_result(
                     if waiter.done():
                         await waiter
                         pytest.fail(
-                            "Completion finished before PostgreSQL reported the cancellation lock"
+                            "Finalization finished before PostgreSQL reported the cancellation lock"
                         )
                     blocked = await observer.scalar(
                         text("SELECT :holder_pid = ANY(pg_blocking_pids(:waiter_pid))"),
@@ -308,14 +324,14 @@ async def test_cancellation_fences_a_late_successful_result(
 
             await holder_transaction.commit()
             async with asyncio.timeout(10):
-                completed = await waiter
+                finalized = await waiter
         finally:
             if not waiter.done():
                 waiter.cancel()
             async with asyncio.timeout(10):
                 await asyncio.gather(waiter, return_exceptions=True)
 
-    assert completed is False
+    assert finalized is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
 
@@ -326,3 +342,102 @@ async def test_cancellation_fences_a_late_successful_result(
     assert stored.error is None
     assert stored.execution_token is None
     assert stored.lease_expires_at is None
+
+
+async def test_current_owner_persists_a_terminal_error_and_rejects_late_outcomes(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """A permanent error can end the first attempt; subsequent outcomes preserve it."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    async with postgres_session_factory() as session:
+        started_at = await session.scalar(
+            select(TaskModel.started_at).where(TaskModel.id == task_id)
+        )
+
+    failed = await _finalize_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        execution_token=claimed.execution_token,
+        outcome="failure",
+    )
+    assert failed is True
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+    assert stored is not None
+    assert stored.status is TaskStatus.FAILED
+    assert stored.attempt_count == claimed.attempt_count == 1
+    assert stored.max_attempts == claimed.max_attempts == 3
+    assert stored.started_at == started_at
+    assert stored.started_at is not None
+    assert stored.finished_at is not None
+    assert stored.finished_at >= stored.started_at
+    assert stored.error == _ERROR
+    assert stored.result is None
+    assert stored.dispatch_token is None
+    assert stored.execution_token is None
+    assert stored.lease_expires_at is None
+    failed_at = stored.finished_at
+
+    async with postgres_session_factory.begin() as session:
+        repository = TaskExecutionRepository(session)
+        assert not await repository.fail_execution(
+            task_id,
+            execution_token=claimed.execution_token,
+            error={"code": "LATE_ERROR"},
+        )
+        assert not await repository.complete_execution(
+            task_id,
+            execution_token=claimed.execution_token,
+            result=_RESULT,
+        )
+
+    async with postgres_session_factory() as session:
+        preserved = await session.get(TaskModel, task_id)
+    assert preserved is not None
+    assert preserved.status is TaskStatus.FAILED
+    assert preserved.error == _ERROR
+    assert preserved.result is None
+    assert preserved.finished_at == failed_at
+    assert preserved.started_at == started_at
+    assert preserved.attempt_count == 1
+
+
+async def test_rolling_back_failure_preserves_execution_ownership(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """The caller can roll back a terminal update without losing the active lease."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+
+    async with postgres_session_factory() as session, session.begin() as transaction:
+        assert await TaskExecutionRepository(session).fail_execution(
+            task_id,
+            execution_token=claimed.execution_token,
+            error=_ERROR,
+        )
+        await transaction.rollback()
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+    assert stored is not None
+    assert stored.status is TaskStatus.IN_PROGRESS
+    assert stored.attempt_count == claimed.attempt_count
+    assert stored.execution_token == claimed.execution_token
+    assert stored.lease_expires_at == claimed.lease_expires_at
+    assert stored.finished_at is None
+    assert stored.result is None
+    assert stored.error is None

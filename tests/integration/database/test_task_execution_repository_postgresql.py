@@ -1,7 +1,7 @@
 """Task execution ownership guarantees exercised against PostgreSQL."""
 
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Literal
 from uuid import UUID
 
@@ -31,6 +31,8 @@ _RESULT: JsonObject = {
     "description_length": 37,
 }
 _ERROR: JsonObject = {"code": "PROCESSING_FAILED", "retryable": False}
+
+type ExecutionOperation = Literal["completion", "failure", "retry", "renewal"]
 
 
 async def _create_pending_task(
@@ -75,16 +77,22 @@ async def _claim_and_commit(
         )
 
 
-async def _finalize_and_commit(
+async def _apply_execution_operation_and_commit(
     session_factory: AsyncSessionFactory,
     *,
     task_id: UUID,
     execution_token: UUID,
-    outcome: Literal["completion", "failure", "retry"],
+    operation: ExecutionOperation,
 ) -> bool:
     async with session_factory.begin() as session:
         repository = TaskExecutionRepository(session)
-        if outcome == "retry":
+        if operation == "renewal":
+            return await repository.renew_execution_lease(
+                task_id,
+                execution_token=execution_token,
+                lease_duration=_EXECUTION_LEASE,
+            )
+        if operation == "retry":
             return await repository.schedule_execution_retry(
                 task_id,
                 execution_token=execution_token,
@@ -92,7 +100,7 @@ async def _finalize_and_commit(
                 event_type=TASK_ROUTING_KEY,
                 message_priority=3,
             )
-        if outcome == "failure":
+        if operation == "failure":
             return await repository.fail_execution(
                 task_id,
                 execution_token=execution_token,
@@ -241,10 +249,10 @@ async def test_current_execution_owner_persists_a_successful_result(
     assert stored.lease_expires_at is None
 
 
-@pytest.mark.parametrize("outcome", ["completion", "failure", "retry"])
-async def test_stale_execution_token_cannot_finalize_an_execution(
+@pytest.mark.parametrize("operation", ["completion", "failure", "retry", "renewal"])
+async def test_stale_execution_token_cannot_modify_an_execution(
     postgres_session_factory: AsyncSessionFactory,
-    outcome: Literal["completion", "failure", "retry"],
+    operation: ExecutionOperation,
 ) -> None:
     """A worker without the current fencing token leaves the active attempt unchanged."""
 
@@ -256,14 +264,14 @@ async def test_stale_execution_token_cannot_finalize_an_execution(
     )
     assert claimed is not None
 
-    finalized = await _finalize_and_commit(
+    changed = await _apply_execution_operation_and_commit(
         postgres_session_factory,
         task_id=task_id,
         execution_token=_STALE_EXECUTION_TOKEN,
-        outcome=outcome,
+        operation=operation,
     )
 
-    assert finalized is False
+    assert changed is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
         event_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
@@ -279,13 +287,13 @@ async def test_stale_execution_token_cannot_finalize_an_execution(
     assert event_count == 1
 
 
-@pytest.mark.parametrize("outcome", ["completion", "failure", "retry"])
-async def test_cancellation_fences_a_late_execution_outcome(
+@pytest.mark.parametrize("operation", ["completion", "failure", "retry", "renewal"])
+async def test_cancellation_fences_a_late_execution_operation(
     postgres_engine: AsyncEngine,
     postgres_session_factory: AsyncSessionFactory,
-    outcome: Literal["completion", "failure", "retry"],
+    operation: ExecutionOperation,
 ) -> None:
-    """A finalization waiting on cancellation rechecks ownership after the lock releases."""
+    """An operation waiting on cancellation rechecks ownership after the lock releases."""
 
     task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
     claimed = await _claim_and_commit(
@@ -326,11 +334,11 @@ async def test_cancellation_fences_a_late_execution_outcome(
             expire_on_commit=False,
         )
         waiter = asyncio.create_task(
-            _finalize_and_commit(
+            _apply_execution_operation_and_commit(
                 waiting_factory,
                 task_id=task_id,
                 execution_token=claimed.execution_token,
-                outcome=outcome,
+                operation=operation,
             )
         )
         try:
@@ -339,7 +347,7 @@ async def test_cancellation_fences_a_late_execution_outcome(
                     if waiter.done():
                         await waiter
                         pytest.fail(
-                            "Finalization finished before PostgreSQL reported the cancellation lock"
+                            "Operation finished before PostgreSQL reported the cancellation lock"
                         )
                     blocked = await observer.scalar(
                         text("SELECT :holder_pid = ANY(pg_blocking_pids(:waiter_pid))"),
@@ -350,14 +358,14 @@ async def test_cancellation_fences_a_late_execution_outcome(
 
             await holder_transaction.commit()
             async with asyncio.timeout(10):
-                finalized = await waiter
+                changed = await waiter
         finally:
             if not waiter.done():
                 waiter.cancel()
             async with asyncio.timeout(10):
                 await asyncio.gather(waiter, return_exceptions=True)
 
-    assert finalized is False
+    assert changed is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
         events = (await session.scalars(select(OutboxEventModel))).all()
@@ -390,11 +398,11 @@ async def test_current_owner_persists_a_terminal_error_and_rejects_late_outcomes
             select(TaskModel.started_at).where(TaskModel.id == task_id)
         )
 
-    failed = await _finalize_and_commit(
+    failed = await _apply_execution_operation_and_commit(
         postgres_session_factory,
         task_id=task_id,
         execution_token=claimed.execution_token,
-        outcome="failure",
+        operation="failure",
     )
     assert failed is True
 
@@ -472,6 +480,108 @@ async def test_rolling_back_failure_preserves_execution_ownership(
     assert stored.error is None
 
 
+@pytest.mark.parametrize("lease_state", ["active", "longer", "expired_last_attempt"])
+async def test_current_owner_renews_only_the_execution_lease(
+    postgres_session_factory: AsyncSessionFactory,
+    lease_state: Literal["active", "longer", "expired_last_attempt"],
+) -> None:
+    """Renewal preserves ownership, never shortens a lease, and permits unrecovered expiry."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    if lease_state != "active":
+        async with postgres_session_factory.begin() as session:
+            statement = update(TaskModel).where(TaskModel.id == task_id)
+            if lease_state == "expired_last_attempt":
+                statement = statement.values(
+                    lease_expires_at=TaskModel.created_at,
+                    attempt_count=TaskModel.max_attempts,
+                )
+            else:
+                statement = statement.values(
+                    lease_expires_at=func.clock_timestamp() + timedelta(hours=1)
+                )
+            await session.execute(statement)
+
+    task_statement = select(TaskModel.__table__).where(TaskModel.id == task_id)
+    async with postgres_session_factory() as session:
+        original = (await session.execute(task_statement)).one()._asdict()
+        original_events = (await session.execute(select(OutboxEventModel.__table__))).all()
+    previous_lease = original["lease_expires_at"]
+    assert isinstance(previous_lease, datetime)
+    lease_duration = timedelta(minutes=2)
+
+    async with postgres_session_factory.begin() as session:
+        before_renewal = await session.scalar(select(func.clock_timestamp()))
+        assert await TaskExecutionRepository(session).renew_execution_lease(
+            task_id,
+            execution_token=claimed.execution_token,
+            lease_duration=lease_duration,
+        )
+        after_renewal = await session.scalar(select(func.clock_timestamp()))
+
+    async with postgres_session_factory() as session:
+        renewed = (await session.execute(task_statement)).one()._asdict()
+        renewed_events = (await session.execute(select(OutboxEventModel.__table__))).all()
+    assert isinstance(before_renewal, datetime)
+    assert isinstance(after_renewal, datetime)
+    renewed_lease = renewed["lease_expires_at"]
+    assert isinstance(renewed_lease, datetime)
+    assert max(previous_lease, before_renewal + lease_duration) <= renewed_lease
+    assert renewed_lease <= max(previous_lease, after_renewal + lease_duration)
+    if lease_state == "longer":
+        assert renewed_lease == previous_lease
+    else:
+        assert renewed_lease > previous_lease
+    if lease_state == "expired_last_attempt":
+        assert previous_lease <= before_renewal
+        assert original["attempt_count"] == original["max_attempts"] == 3
+    assert renewed == {**original, "lease_expires_at": renewed_lease}
+    assert renewed_events == original_events
+
+
+async def test_rolling_back_renewal_preserves_the_previous_lease(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """The caller retains transaction ownership even after a successful renewal."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    task_statement = select(TaskModel.__table__).where(TaskModel.id == task_id)
+    async with postgres_session_factory() as session:
+        original = (await session.execute(task_statement)).one()
+        original_events = (await session.execute(select(OutboxEventModel.__table__))).all()
+
+    async with postgres_session_factory() as session, session.begin() as transaction:
+        assert await TaskExecutionRepository(session).renew_execution_lease(
+            task_id,
+            execution_token=claimed.execution_token,
+            lease_duration=timedelta(minutes=2),
+        )
+        renewed_lease = await session.scalar(
+            select(TaskModel.lease_expires_at).where(TaskModel.id == task_id)
+        )
+        assert renewed_lease is not None
+        assert renewed_lease > claimed.lease_expires_at
+        await transaction.rollback()
+
+    async with postgres_session_factory() as session:
+        preserved = (await session.execute(task_statement)).one()
+        preserved_events = (await session.execute(select(OutboxEventModel.__table__))).all()
+    assert preserved == original
+    assert preserved_events == original_events
+
+
 @pytest.mark.parametrize("retry_delay", [timedelta(0), _RETRY_DELAY])
 async def test_retry_persists_a_new_dispatch_event_and_fences_the_old_attempt(
     postgres_session_factory: AsyncSessionFactory,
@@ -541,11 +651,11 @@ async def test_retry_persists_a_new_dispatch_event_and_fences_the_old_attempt(
     assert retry_event.lease_expires_at is None
     assert retry_event.last_error is None
 
-    assert not await _finalize_and_commit(
+    assert not await _apply_execution_operation_and_commit(
         postgres_session_factory,
         task_id=task_id,
         execution_token=claimed.execution_token,
-        outcome="retry",
+        operation="retry",
     )
     assert (
         await _claim_and_commit(
@@ -563,12 +673,12 @@ async def test_retry_persists_a_new_dispatch_event_and_fences_the_old_attempt(
     assert next_claim is not None
     assert next_claim.attempt_count == 2
     assert next_claim.execution_token != claimed.execution_token
-    for outcome in ("completion", "failure", "retry"):
-        assert not await _finalize_and_commit(
+    for operation in ("completion", "failure", "retry", "renewal"):
+        assert not await _apply_execution_operation_and_commit(
             postgres_session_factory,
             task_id=task_id,
             execution_token=claimed.execution_token,
-            outcome=outcome,
+            operation=operation,
         )
 
     async with postgres_session_factory() as session:
@@ -602,11 +712,11 @@ async def test_retry_does_not_exceed_the_attempt_limit(
             .values(attempt_count=TaskModel.max_attempts)
         )
 
-    assert not await _finalize_and_commit(
+    assert not await _apply_execution_operation_and_commit(
         postgres_session_factory,
         task_id=task_id,
         execution_token=claimed.execution_token,
-        outcome="retry",
+        operation="retry",
     )
 
     async with postgres_session_factory() as session:
@@ -716,11 +826,11 @@ async def test_waiting_operation_observes_the_committed_retry(
         operation = (
             _cancel_and_commit(waiting_factory, task_id=task_id)
             if competitor == "cancellation"
-            else _finalize_and_commit(
+            else _apply_execution_operation_and_commit(
                 waiting_factory,
                 task_id=task_id,
                 execution_token=claimed.execution_token,
-                outcome="retry",
+                operation="retry",
             )
         )
         waiter = asyncio.create_task(operation)

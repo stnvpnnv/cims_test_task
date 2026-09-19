@@ -30,7 +30,7 @@ class ClaimedTaskExecution:
 
 
 class TaskExecutionRepository:
-    """Acquire, retry, and finalize executions without owning the transaction."""
+    """Manage task execution ownership without owning the transaction."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -102,6 +102,35 @@ class TaskExecutionRepository:
             execution_token=stored_execution_token,
             lease_expires_at=lease_expires_at,
         )
+
+    async def renew_execution_lease(
+        self,
+        task_id: UUID,
+        *,
+        execution_token: UUID,
+        lease_duration: timedelta,
+    ) -> bool:
+        """Extend the current owner's lease; expiry alone does not revoke ownership."""
+
+        if lease_duration <= timedelta(0):
+            raise ValueError("lease_duration must be positive")
+
+        statement = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task_id,
+                TaskModel.status == TaskStatus.IN_PROGRESS,
+                TaskModel.execution_token == execution_token,
+            )
+            .values(
+                lease_expires_at=func.greatest(
+                    TaskModel.lease_expires_at,
+                    func.clock_timestamp() + lease_duration,
+                ),
+            )
+            .returning(TaskModel.id)
+        )
+        return await self._session.scalar(statement) is not None
 
     async def schedule_execution_retry(
         self,

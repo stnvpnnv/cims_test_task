@@ -79,7 +79,7 @@ def _compiled_parameters(statement: ClauseElement) -> dict[str, object]:
     )
 
 
-def _retry_session(stored_task_id: UUID | None) -> Mock:
+def _mutation_session(stored_task_id: UUID | None) -> Mock:
     return Mock(
         scalar=AsyncMock(return_value=stored_task_id),
         add=Mock(),
@@ -88,6 +88,108 @@ def _retry_session(stored_task_id: UUID | None) -> Mock:
         commit=AsyncMock(),
         rollback=AsyncMock(),
     )
+
+
+@pytest.mark.parametrize(
+    ("stored_task_id", "expected"),
+    [(_TASK_ID, True), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_lease_renewal_only_extends_the_current_owners_deadline(
+    stored_task_id: UUID | None,
+    expected: bool,
+) -> None:
+    """One fenced update uses database time without changing execution metadata."""
+
+    session = _mutation_session(stored_task_id)
+
+    renewed = await TaskExecutionRepository(cast(AsyncSession, session)).renew_execution_lease(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        lease_duration=_LEASE_DURATION,
+    )
+
+    assert renewed is expected
+    session.scalar.assert_awaited_once()
+    statement = session.scalar.await_args.args[0]
+    sql = _compiled_sql(statement)
+    set_sql, where_sql = sql.split(" WHERE ", maxsplit=1)
+    assert set_sql.startswith(
+        "UPDATE tasks SET lease_expires_at=greatest(tasks.lease_expires_at, clock_timestamp() +"
+    )
+    for field in (
+        "status",
+        "started_at",
+        "finished_at",
+        "attempt_count",
+        "max_attempts",
+        "dispatch_token",
+        "execution_token",
+        "result",
+        "error",
+    ):
+        assert f"{field}=" not in set_sql
+    assert "tasks.id =" in where_sql
+    assert "tasks.status =" in where_sql
+    assert "tasks.execution_token =" in where_sql
+    assert "lease_expires_at" not in where_sql
+    assert "clock_timestamp" not in where_sql
+    assert "attempt_count" not in where_sql
+    assert "max_attempts" not in where_sql
+    assert sql.endswith("RETURNING tasks.id")
+
+    parameters = _compiled_parameters(statement)
+    assert parameters["id_1"] == _TASK_ID
+    assert parameters["status_1"] is TaskStatus.IN_PROGRESS
+    assert parameters["execution_token_1"] == _EXECUTION_TOKEN
+    assert _LEASE_DURATION in parameters.values()
+    session.add.assert_not_called()
+    session.flush.assert_not_awaited()
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
+
+
+@pytest.mark.parametrize("lease_duration", [timedelta(0), timedelta(microseconds=-1)])
+@pytest.mark.asyncio
+async def test_lease_renewal_rejects_a_non_positive_duration_before_database_access(
+    lease_duration: timedelta,
+) -> None:
+    """Invalid heartbeat settings cannot alter the existing lease."""
+
+    session = _mutation_session(_TASK_ID)
+
+    with pytest.raises(ValueError, match=r"^lease_duration must be positive$"):
+        await TaskExecutionRepository(cast(AsyncSession, session)).renew_execution_lease(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            lease_duration=lease_duration,
+        )
+
+    session.scalar.assert_not_awaited()
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_propagates_database_failure_to_the_caller() -> None:
+    """An unavailable database is not reported as lost execution ownership."""
+
+    session = _mutation_session(_TASK_ID)
+    session.scalar.side_effect = TimeoutError("database timeout")
+
+    with pytest.raises(TimeoutError, match=r"^database timeout$"):
+        await TaskExecutionRepository(cast(AsyncSession, session)).renew_execution_lease(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            lease_duration=_LEASE_DURATION,
+        )
+
+    session.scalar.assert_awaited_once()
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.parametrize("retry_delay", [timedelta(0), timedelta(seconds=15)])
@@ -104,7 +206,7 @@ async def test_retry_fences_the_transition_and_enqueues_only_for_the_winner(
 ) -> None:
     """Retry creates a fresh delayed dispatch without consuming another attempt."""
 
-    session = _retry_session(stored_task_id)
+    session = _mutation_session(stored_task_id)
     token_factory = Mock(side_effect=[_DISPATCH_TOKEN, _OUTBOX_EVENT_ID])
     monkeypatch.setattr(task_execution_repository, "uuid4", token_factory)
 
@@ -182,7 +284,7 @@ async def test_retry_rejects_a_negative_delay_before_database_access(
 ) -> None:
     """An invalid delay cannot mutate the task or create an outbox event."""
 
-    session = _retry_session(_TASK_ID)
+    session = _mutation_session(_TASK_ID)
     token_factory = Mock()
     monkeypatch.setattr(task_execution_repository, "uuid4", token_factory)
 
@@ -205,7 +307,7 @@ async def test_retry_rejects_a_negative_delay_before_database_access(
 async def test_retry_propagates_outbox_flush_failure_to_the_transaction_owner() -> None:
     """Outbox persistence failure must abort the caller's transaction."""
 
-    session = _retry_session(_TASK_ID)
+    session = _mutation_session(_TASK_ID)
     session.flush.side_effect = OSError("storage unavailable")
 
     with pytest.raises(OSError, match=r"^storage unavailable$"):

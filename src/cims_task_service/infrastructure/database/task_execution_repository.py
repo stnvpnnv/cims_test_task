@@ -8,7 +8,11 @@ from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
-from cims_task_service.infrastructure.database.models import JsonObject, TaskModel
+from cims_task_service.infrastructure.database.models import (
+    JsonObject,
+    OutboxEventModel,
+    TaskModel,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +30,7 @@ class ClaimedTaskExecution:
 
 
 class TaskExecutionRepository:
-    """Acquire and finalize task executions without owning the transaction."""
+    """Acquire, retry, and finalize executions without owning the transaction."""
 
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -98,6 +102,58 @@ class TaskExecutionRepository:
             execution_token=stored_execution_token,
             lease_expires_at=lease_expires_at,
         )
+
+    async def schedule_execution_retry(
+        self,
+        task_id: UUID,
+        *,
+        execution_token: UUID,
+        retry_delay: timedelta,
+        event_type: str,
+        message_priority: int,
+    ) -> bool:
+        """Release the current execution and enqueue its retry in the caller's transaction."""
+
+        if retry_delay < timedelta(0):
+            raise ValueError("retry_delay must not be negative")
+
+        dispatch_token = uuid4()
+        statement = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task_id,
+                TaskModel.status == TaskStatus.IN_PROGRESS,
+                TaskModel.execution_token == execution_token,
+                TaskModel.attempt_count < TaskModel.max_attempts,
+            )
+            .values(
+                status=TaskStatus.PENDING,
+                dispatch_token=dispatch_token,
+                execution_token=None,
+                lease_expires_at=None,
+            )
+            .returning(TaskModel.id)
+        )
+        if await self._session.scalar(statement) is None:
+            return False
+
+        outbox_event = OutboxEventModel(
+            id=uuid4(),
+            task_id=task_id,
+            event_type=event_type,
+            payload={"task_id": str(task_id), "dispatch_token": str(dispatch_token)},
+            message_priority=message_priority,
+            available_at=func.clock_timestamp() + retry_delay,
+            published_at=None,
+            discarded_at=None,
+            publish_attempts=0,
+            publisher_token=None,
+            lease_expires_at=None,
+            last_error=None,
+        )
+        self._session.add(outbox_event)
+        await self._session.flush()
+        return True
 
     async def complete_execution(
         self,

@@ -6,12 +6,13 @@ from typing import Literal
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cims_task_service.application.task_creation import CreateTaskCommand, create_task
 from cims_task_service.domain.task import TaskPriority, TaskStatus
-from cims_task_service.infrastructure.database.models import JsonObject, TaskModel
+from cims_task_service.infrastructure.database.models import JsonObject, OutboxEventModel, TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 from cims_task_service.infrastructure.database.task_execution_repository import (
     ClaimedTaskExecution,
@@ -23,6 +24,7 @@ from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
 _EXECUTION_LEASE = timedelta(minutes=1)
+_RETRY_DELAY = timedelta(seconds=30)
 _STALE_EXECUTION_TOKEN = UUID("40000000-0000-4000-8000-000000000004")
 _RESULT: JsonObject = {
     "name_length": 20,
@@ -78,10 +80,18 @@ async def _finalize_and_commit(
     *,
     task_id: UUID,
     execution_token: UUID,
-    outcome: Literal["completion", "failure"],
+    outcome: Literal["completion", "failure", "retry"],
 ) -> bool:
     async with session_factory.begin() as session:
         repository = TaskExecutionRepository(session)
+        if outcome == "retry":
+            return await repository.schedule_execution_retry(
+                task_id,
+                execution_token=execution_token,
+                retry_delay=_RETRY_DELAY,
+                event_type=TASK_ROUTING_KEY,
+                message_priority=3,
+            )
         if outcome == "failure":
             return await repository.fail_execution(
                 task_id,
@@ -93,6 +103,20 @@ async def _finalize_and_commit(
             execution_token=execution_token,
             result=_RESULT,
         )
+
+
+async def _cancel_and_commit(
+    session_factory: AsyncSessionFactory,
+    *,
+    task_id: UUID,
+) -> bool:
+    async with session_factory.begin() as session:
+        cancellation = await TaskRepository(session).cancel_with_outbox(
+            task_id,
+            event_type=TASK_ROUTING_KEY,
+        )
+        assert cancellation is not None
+        return cancellation.changed
 
 
 async def test_concurrent_claims_grant_exactly_one_execution_lease(
@@ -217,10 +241,10 @@ async def test_current_execution_owner_persists_a_successful_result(
     assert stored.lease_expires_at is None
 
 
-@pytest.mark.parametrize("outcome", ["completion", "failure"])
+@pytest.mark.parametrize("outcome", ["completion", "failure", "retry"])
 async def test_stale_execution_token_cannot_finalize_an_execution(
     postgres_session_factory: AsyncSessionFactory,
-    outcome: Literal["completion", "failure"],
+    outcome: Literal["completion", "failure", "retry"],
 ) -> None:
     """A worker without the current fencing token leaves the active attempt unchanged."""
 
@@ -242,6 +266,7 @@ async def test_stale_execution_token_cannot_finalize_an_execution(
     assert finalized is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
+        event_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
 
     assert stored is not None
     assert stored.status is TaskStatus.IN_PROGRESS
@@ -251,13 +276,14 @@ async def test_stale_execution_token_cannot_finalize_an_execution(
     assert stored.finished_at is None
     assert stored.execution_token == claimed.execution_token
     assert stored.lease_expires_at == claimed.lease_expires_at
+    assert event_count == 1
 
 
-@pytest.mark.parametrize("outcome", ["completion", "failure"])
+@pytest.mark.parametrize("outcome", ["completion", "failure", "retry"])
 async def test_cancellation_fences_a_late_execution_outcome(
     postgres_engine: AsyncEngine,
     postgres_session_factory: AsyncSessionFactory,
-    outcome: Literal["completion", "failure"],
+    outcome: Literal["completion", "failure", "retry"],
 ) -> None:
     """A finalization waiting on cancellation rechecks ownership after the lock releases."""
 
@@ -334,6 +360,7 @@ async def test_cancellation_fences_a_late_execution_outcome(
     assert finalized is False
     async with postgres_session_factory() as session:
         stored = await session.scalar(select(TaskModel).where(TaskModel.id == task_id))
+        events = (await session.scalars(select(OutboxEventModel))).all()
 
     assert stored is not None
     assert stored.status is TaskStatus.CANCELLED
@@ -342,6 +369,8 @@ async def test_cancellation_fences_a_late_execution_outcome(
     assert stored.error is None
     assert stored.execution_token is None
     assert stored.lease_expires_at is None
+    assert len(events) == 1
+    assert events[0].discarded_at is not None
 
 
 async def test_current_owner_persists_a_terminal_error_and_rejects_late_outcomes(
@@ -441,3 +470,305 @@ async def test_rolling_back_failure_preserves_execution_ownership(
     assert stored.finished_at is None
     assert stored.result is None
     assert stored.error is None
+
+
+@pytest.mark.parametrize("retry_delay", [timedelta(0), _RETRY_DELAY])
+async def test_retry_persists_a_new_dispatch_event_and_fences_the_old_attempt(
+    postgres_session_factory: AsyncSessionFactory,
+    retry_delay: timedelta,
+) -> None:
+    """Retry commits a fresh, deferred dispatch without consuming another attempt."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    async with postgres_session_factory() as session:
+        started_at = await session.scalar(
+            select(TaskModel.started_at).where(TaskModel.id == task_id)
+        )
+        original_event_id = await session.scalar(select(OutboxEventModel.id))
+    assert started_at is not None
+    assert original_event_id is not None
+
+    async with postgres_session_factory.begin() as session:
+        before_retry = await session.scalar(select(func.clock_timestamp()))
+        assert await TaskExecutionRepository(session).schedule_execution_retry(
+            task_id,
+            execution_token=claimed.execution_token,
+            retry_delay=retry_delay,
+            event_type=TASK_ROUTING_KEY,
+            message_priority=3,
+        )
+        after_retry = await session.scalar(select(func.clock_timestamp()))
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+        events = (await session.scalars(select(OutboxEventModel))).all()
+    assert stored is not None
+    assert stored.status is TaskStatus.PENDING
+    assert stored.attempt_count == claimed.attempt_count == 1
+    assert stored.max_attempts == claimed.max_attempts == 3
+    assert stored.started_at == started_at
+    assert stored.finished_at is None
+    assert stored.result is None
+    assert stored.error is None
+    assert stored.execution_token is None
+    assert stored.lease_expires_at is None
+    retry_dispatch_token = stored.dispatch_token
+    assert retry_dispatch_token is not None
+    assert retry_dispatch_token != dispatch_token
+    assert len(events) == 2
+    retry_event = next(event for event in events if event.id != original_event_id)
+    assert retry_event.task_id == task_id
+    assert retry_event.event_type == TASK_ROUTING_KEY
+    assert retry_event.message_priority == 3
+    assert retry_event.payload == {
+        "task_id": str(task_id),
+        "dispatch_token": str(retry_dispatch_token),
+    }
+    assert before_retry is not None
+    assert after_retry is not None
+    assert before_retry + retry_delay <= retry_event.available_at <= after_retry + retry_delay
+    assert retry_event.available_at >= retry_event.created_at
+    assert retry_event.published_at is None
+    assert retry_event.discarded_at is None
+    assert retry_event.publish_attempts == 0
+    assert retry_event.publisher_token is None
+    assert retry_event.lease_expires_at is None
+    assert retry_event.last_error is None
+
+    assert not await _finalize_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        execution_token=claimed.execution_token,
+        outcome="retry",
+    )
+    assert (
+        await _claim_and_commit(
+            postgres_session_factory,
+            task_id=task_id,
+            dispatch_token=dispatch_token,
+        )
+        is None
+    )
+    next_claim = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=retry_dispatch_token,
+    )
+    assert next_claim is not None
+    assert next_claim.attempt_count == 2
+    assert next_claim.execution_token != claimed.execution_token
+    for outcome in ("completion", "failure", "retry"):
+        assert not await _finalize_and_commit(
+            postgres_session_factory,
+            task_id=task_id,
+            execution_token=claimed.execution_token,
+            outcome=outcome,
+        )
+
+    async with postgres_session_factory() as session:
+        preserved = await session.get(TaskModel, task_id)
+        event_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
+    assert preserved is not None
+    assert preserved.status is TaskStatus.IN_PROGRESS
+    assert preserved.execution_token == next_claim.execution_token
+    assert preserved.lease_expires_at == next_claim.lease_expires_at
+    assert preserved.started_at == started_at
+    assert preserved.attempt_count == 2
+    assert event_count == 2
+
+
+async def test_retry_does_not_exceed_the_attempt_limit(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """An exhausted active attempt cannot create an unclaimable pending task."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    async with postgres_session_factory.begin() as session:
+        await session.execute(
+            update(TaskModel)
+            .where(TaskModel.id == task_id)
+            .values(attempt_count=TaskModel.max_attempts)
+        )
+
+    assert not await _finalize_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        execution_token=claimed.execution_token,
+        outcome="retry",
+    )
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+        event_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
+    assert stored is not None
+    assert stored.status is TaskStatus.IN_PROGRESS
+    assert stored.attempt_count == stored.max_attempts == 3
+    assert stored.execution_token == claimed.execution_token
+    assert stored.lease_expires_at == claimed.lease_expires_at
+    assert stored.dispatch_token is None
+    assert stored.finished_at is None
+    assert event_count == 1
+
+
+async def test_failed_retry_event_insert_rolls_back_the_task_transition(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """An outbox constraint failure cannot leave a pending task without its event."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+    async with postgres_session_factory() as session:
+        started_at = await session.scalar(
+            select(TaskModel.started_at).where(TaskModel.id == task_id)
+        )
+
+    with pytest.raises(IntegrityError, match="message_priority"):
+        async with postgres_session_factory.begin() as session:
+            await TaskExecutionRepository(session).schedule_execution_retry(
+                task_id,
+                execution_token=claimed.execution_token,
+                retry_delay=_RETRY_DELAY,
+                event_type=TASK_ROUTING_KEY,
+                message_priority=0,
+            )
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+        event_count = await session.scalar(select(func.count()).select_from(OutboxEventModel))
+    assert stored is not None
+    assert stored.status is TaskStatus.IN_PROGRESS
+    assert stored.attempt_count == claimed.attempt_count
+    assert stored.started_at == started_at
+    assert stored.execution_token == claimed.execution_token
+    assert stored.lease_expires_at == claimed.lease_expires_at
+    assert stored.dispatch_token is None
+    assert stored.finished_at is None
+    assert stored.result is None
+    assert stored.error is None
+    assert event_count == 1
+
+
+@pytest.mark.parametrize("competitor", ["retry", "cancellation"])
+async def test_waiting_operation_observes_the_committed_retry(
+    postgres_engine: AsyncEngine,
+    postgres_session_factory: AsyncSessionFactory,
+    competitor: Literal["retry", "cancellation"],
+) -> None:
+    """A competing retry loses ownership; a waiting cancellation discards the new event."""
+
+    task_id, dispatch_token = await _create_pending_task(postgres_session_factory)
+    claimed = await _claim_and_commit(
+        postgres_session_factory,
+        task_id=task_id,
+        dispatch_token=dispatch_token,
+    )
+    assert claimed is not None
+
+    async with (
+        postgres_session_factory() as holder,
+        postgres_engine.connect() as waiting_connection,
+        postgres_engine.connect() as observer,
+        holder.begin() as holder_transaction,
+    ):
+        holder_pid = await holder.scalar(text("SELECT pg_backend_pid()"))
+        waiter_pid = await waiting_connection.scalar(text("SELECT pg_backend_pid()"))
+        observer_pid = await observer.scalar(text("SELECT pg_backend_pid()"))
+        assert isinstance(holder_pid, int)
+        assert isinstance(waiter_pid, int)
+        assert isinstance(observer_pid, int)
+        assert len({holder_pid, waiter_pid, observer_pid}) == 3
+        await waiting_connection.commit()
+
+        assert await TaskExecutionRepository(holder).schedule_execution_retry(
+            task_id,
+            execution_token=claimed.execution_token,
+            retry_delay=_RETRY_DELAY,
+            event_type=TASK_ROUTING_KEY,
+            message_priority=3,
+        )
+        retry_dispatch_token = await holder.scalar(
+            select(TaskModel.dispatch_token).where(TaskModel.id == task_id)
+        )
+        assert retry_dispatch_token is not None
+
+        waiting_factory: AsyncSessionFactory = async_sessionmaker[AsyncSession](
+            bind=waiting_connection,
+            autoflush=False,
+            expire_on_commit=False,
+        )
+        operation = (
+            _cancel_and_commit(waiting_factory, task_id=task_id)
+            if competitor == "cancellation"
+            else _finalize_and_commit(
+                waiting_factory,
+                task_id=task_id,
+                execution_token=claimed.execution_token,
+                outcome="retry",
+            )
+        )
+        waiter = asyncio.create_task(operation)
+        try:
+            async with asyncio.timeout(10):
+                while True:
+                    if waiter.done():
+                        await waiter
+                        pytest.fail(
+                            "Competing operation finished before the retry lock was observed"
+                        )
+                    blocked = await observer.scalar(
+                        text("SELECT :holder_pid = ANY(pg_blocking_pids(:waiter_pid))"),
+                        {"holder_pid": holder_pid, "waiter_pid": waiter_pid},
+                    )
+                    if blocked:
+                        break
+
+            await holder_transaction.commit()
+            async with asyncio.timeout(10):
+                changed = await waiter
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+            async with asyncio.timeout(10):
+                await asyncio.gather(waiter, return_exceptions=True)
+
+    async with postgres_session_factory() as session:
+        stored = await session.get(TaskModel, task_id)
+        events = (await session.scalars(select(OutboxEventModel))).all()
+    assert stored is not None
+    assert stored.attempt_count == 1
+    assert stored.execution_token is None
+    assert stored.lease_expires_at is None
+    assert len(events) == 2
+    retry_event = next(
+        event for event in events if event.payload["dispatch_token"] == str(retry_dispatch_token)
+    )
+    assert retry_event.published_at is None
+    if competitor == "cancellation":
+        assert changed is True
+        assert stored.status is TaskStatus.CANCELLED
+        assert stored.dispatch_token is None
+        assert stored.finished_at is not None
+        assert all(event.discarded_at is not None for event in events)
+    else:
+        assert changed is False
+        assert stored.status is TaskStatus.PENDING
+        assert stored.dispatch_token == retry_dispatch_token
+        assert stored.finished_at is None
+        assert retry_event.discarded_at is None

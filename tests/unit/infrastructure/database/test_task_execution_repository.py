@@ -13,16 +13,18 @@ from sqlalchemy.sql import ClauseElement
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database import task_execution_repository
-from cims_task_service.infrastructure.database.models import JsonObject
+from cims_task_service.infrastructure.database.models import JsonObject, OutboxEventModel
 from cims_task_service.infrastructure.database.task_execution_repository import (
     ClaimedTaskExecution,
     TaskExecutionRepository,
 )
+from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 
 _POSTGRESQL_DIALECT = PGDialect()  # type: ignore[no-untyped-call]
 _TASK_ID = UUID("10000000-0000-4000-8000-000000000001")
 _DISPATCH_TOKEN = UUID("20000000-0000-4000-8000-000000000002")
 _EXECUTION_TOKEN = UUID("30000000-0000-4000-8000-000000000003")
+_OUTBOX_EVENT_ID = UUID("50000000-0000-4000-8000-000000000005")
 _LEASE_DURATION = timedelta(minutes=1)
 _LEASE_EXPIRES_AT = datetime(2026, 9, 19, 2, 1, tzinfo=UTC)
 _RESULT: JsonObject = {
@@ -75,6 +77,152 @@ def _compiled_parameters(statement: ClauseElement) -> dict[str, object]:
         dict[str, object],
         statement.compile(dialect=_POSTGRESQL_DIALECT).params,
     )
+
+
+def _retry_session(stored_task_id: UUID | None) -> Mock:
+    return Mock(
+        scalar=AsyncMock(return_value=stored_task_id),
+        add=Mock(),
+        flush=AsyncMock(),
+        begin=Mock(),
+        commit=AsyncMock(),
+        rollback=AsyncMock(),
+    )
+
+
+@pytest.mark.parametrize("retry_delay", [timedelta(0), timedelta(seconds=15)])
+@pytest.mark.parametrize(
+    ("stored_task_id", "expected"),
+    [(_TASK_ID, True), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_retry_fences_the_transition_and_enqueues_only_for_the_winner(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_delay: timedelta,
+    stored_task_id: UUID | None,
+    expected: bool,
+) -> None:
+    """Retry creates a fresh delayed dispatch without consuming another attempt."""
+
+    session = _retry_session(stored_task_id)
+    token_factory = Mock(side_effect=[_DISPATCH_TOKEN, _OUTBOX_EVENT_ID])
+    monkeypatch.setattr(task_execution_repository, "uuid4", token_factory)
+
+    scheduled = await TaskExecutionRepository(cast(AsyncSession, session)).schedule_execution_retry(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        retry_delay=retry_delay,
+        event_type=TASK_ROUTING_KEY,
+        message_priority=3,
+    )
+
+    assert scheduled is expected
+    session.scalar.assert_awaited_once()
+    statement = session.scalar.await_args.args[0]
+    sql = _compiled_sql(statement)
+    set_sql, where_sql = sql.split(" WHERE ", maxsplit=1)
+    assert set_sql.startswith("UPDATE tasks SET status=")
+    assert "attempt_count" not in set_sql
+    assert "max_attempts" not in set_sql
+    assert "started_at" not in set_sql
+    assert "finished_at" not in set_sql
+    assert "tasks.id =" in where_sql
+    assert "tasks.status =" in where_sql
+    assert "tasks.execution_token =" in where_sql
+    assert "tasks.attempt_count < tasks.max_attempts" in where_sql
+    assert "lease_expires_at" not in where_sql
+    assert "clock_timestamp" not in where_sql
+    assert sql.endswith("RETURNING tasks.id")
+
+    parameters = _compiled_parameters(statement)
+    assert parameters["id_1"] == _TASK_ID
+    assert parameters["status_1"] is TaskStatus.IN_PROGRESS
+    assert parameters["execution_token_1"] == _EXECUTION_TOKEN
+    assert parameters["status"] is TaskStatus.PENDING
+    assert parameters["dispatch_token"] == _DISPATCH_TOKEN
+    assert parameters["execution_token"] is None
+    assert parameters["lease_expires_at"] is None
+
+    if expected:
+        session.add.assert_called_once()
+        event = session.add.call_args.args[0]
+        assert isinstance(event, OutboxEventModel)
+        assert event.id == _OUTBOX_EVENT_ID
+        assert event.task_id == _TASK_ID
+        assert event.event_type == TASK_ROUTING_KEY
+        assert event.payload == {
+            "task_id": str(_TASK_ID),
+            "dispatch_token": str(_DISPATCH_TOKEN),
+        }
+        assert event.message_priority == 3
+        available_at = cast(ClauseElement, event.available_at)
+        assert _compiled_sql(available_at).startswith("clock_timestamp() +")
+        assert retry_delay in _compiled_parameters(available_at).values()
+        assert event.publish_attempts == 0
+        assert event.published_at is None
+        assert event.discarded_at is None
+        assert event.publisher_token is None
+        assert event.lease_expires_at is None
+        assert event.last_error is None
+        session.flush.assert_awaited_once_with()
+        assert token_factory.call_count == 2
+    else:
+        session.add.assert_not_called()
+        session.flush.assert_not_awaited()
+        token_factory.assert_called_once_with()
+
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_a_negative_delay_before_database_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An invalid delay cannot mutate the task or create an outbox event."""
+
+    session = _retry_session(_TASK_ID)
+    token_factory = Mock()
+    monkeypatch.setattr(task_execution_repository, "uuid4", token_factory)
+
+    with pytest.raises(ValueError, match=r"^retry_delay must not be negative$"):
+        await TaskExecutionRepository(cast(AsyncSession, session)).schedule_execution_retry(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            retry_delay=timedelta(microseconds=-1),
+            event_type=TASK_ROUTING_KEY,
+            message_priority=3,
+        )
+
+    session.scalar.assert_not_awaited()
+    session.add.assert_not_called()
+    session.flush.assert_not_awaited()
+    token_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retry_propagates_outbox_flush_failure_to_the_transaction_owner() -> None:
+    """Outbox persistence failure must abort the caller's transaction."""
+
+    session = _retry_session(_TASK_ID)
+    session.flush.side_effect = OSError("storage unavailable")
+
+    with pytest.raises(OSError, match=r"^storage unavailable$"):
+        await TaskExecutionRepository(cast(AsyncSession, session)).schedule_execution_retry(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            retry_delay=timedelta(seconds=15),
+            event_type=TASK_ROUTING_KEY,
+            message_priority=3,
+        )
+
+    session.scalar.assert_awaited_once()
+    session.add.assert_called_once()
+    session.flush.assert_awaited_once_with()
+    session.begin.assert_not_called()
+    session.commit.assert_not_awaited()
+    session.rollback.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ from sqlalchemy.sql import ClauseElement
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
 from cims_task_service.infrastructure.database import task_execution_repository
+from cims_task_service.infrastructure.database.models import JsonObject
 from cims_task_service.infrastructure.database.task_execution_repository import (
     ClaimedTaskExecution,
     TaskExecutionRepository,
@@ -24,6 +25,10 @@ _DISPATCH_TOKEN = UUID("20000000-0000-4000-8000-000000000002")
 _EXECUTION_TOKEN = UUID("30000000-0000-4000-8000-000000000003")
 _LEASE_DURATION = timedelta(minutes=1)
 _LEASE_EXPIRES_AT = datetime(2026, 9, 19, 2, 1, tzinfo=UTC)
+_RESULT: JsonObject = {
+    "name_length": 12,
+    "description_length": 23,
+}
 
 type _ClaimRow = tuple[
     UUID,
@@ -220,3 +225,64 @@ async def test_claim_rejects_a_returned_row_without_a_complete_lease(
         )
 
     execute.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("stored_task_id", "expected"),
+    [(_TASK_ID, True), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_complete_uses_a_fenced_terminal_transition(
+    stored_task_id: UUID | None,
+    expected: bool,
+) -> None:
+    """Only the current execution owner can persist a successful result."""
+
+    scalar = AsyncMock(return_value=stored_task_id)
+    begin = Mock()
+    commit = AsyncMock()
+    rollback = AsyncMock()
+    session = cast(
+        AsyncSession,
+        Mock(scalar=scalar, begin=begin, commit=commit, rollback=rollback),
+    )
+
+    completed = await TaskExecutionRepository(session).complete_execution(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        result=_RESULT,
+    )
+
+    assert completed is expected
+    scalar.assert_awaited_once()
+    assert scalar.await_args is not None
+    statement = scalar.await_args.args[0]
+    sql = _compiled_sql(statement)
+    assert sql.startswith("UPDATE tasks SET status=")
+    assert "finished_at=clock_timestamp()" in sql
+    assert "result=" in sql
+    assert "error=" in sql
+    assert "dispatch_token=" in sql
+    assert "execution_token=" in sql
+    assert "lease_expires_at=" in sql
+    assert "tasks.id =" in sql
+    assert "tasks.status =" in sql
+    assert "tasks.execution_token =" in sql
+    assert sql.endswith("RETURNING tasks.id")
+    where_sql = sql.split(" WHERE ", maxsplit=1)[1].split(" RETURNING", maxsplit=1)[0]
+    assert "lease_expires_at" not in where_sql
+    assert "clock_timestamp" not in where_sql
+
+    parameters = _compiled_parameters(statement)
+    assert parameters["status"] is TaskStatus.COMPLETED
+    assert parameters["status_1"] is TaskStatus.IN_PROGRESS
+    assert parameters["id_1"] == _TASK_ID
+    assert parameters["execution_token_1"] == _EXECUTION_TOKEN
+    assert parameters["result"] == _RESULT
+    assert parameters["error"] is None
+    assert parameters["dispatch_token"] is None
+    assert parameters["execution_token"] is None
+    assert parameters["lease_expires_at"] is None
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()

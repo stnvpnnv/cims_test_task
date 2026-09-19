@@ -8,7 +8,7 @@ from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
-from cims_task_service.infrastructure.database.models import TaskModel
+from cims_task_service.infrastructure.database.models import JsonObject, TaskModel
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,3 +98,32 @@ class TaskExecutionRepository:
             execution_token=stored_execution_token,
             lease_expires_at=lease_expires_at,
         )
+
+    async def complete_execution(
+        self,
+        task_id: UUID,
+        *,
+        execution_token: UUID,
+        result: JsonObject,
+    ) -> bool:
+        """Persist success only while the caller still owns the execution."""
+
+        statement = (
+            update(TaskModel)
+            .where(
+                TaskModel.id == task_id,
+                TaskModel.status == TaskStatus.IN_PROGRESS,
+                TaskModel.execution_token == execution_token,
+            )
+            .values(
+                status=TaskStatus.COMPLETED,
+                finished_at=func.clock_timestamp(),
+                result=result,
+                error=None,
+                dispatch_token=None,
+                execution_token=None,
+                lease_expires_at=None,
+            )
+            .returning(TaskModel.id)
+        )
+        return await self._session.scalar(statement) is not None

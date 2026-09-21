@@ -16,6 +16,7 @@ from cims_task_service.infrastructure.database import task_execution_repository
 from cims_task_service.infrastructure.database.models import JsonObject, OutboxEventModel
 from cims_task_service.infrastructure.database.task_execution_repository import (
     ClaimedTaskExecution,
+    LockedExpiredTaskExecution,
     TaskExecutionRepository,
 )
 from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
@@ -42,6 +43,14 @@ type _ClaimRow = tuple[
     UUID | None,
     datetime | None,
 ]
+type _ExpiredExecutionRow = tuple[
+    UUID,
+    TaskPriority,
+    int,
+    int,
+    UUID | None,
+    datetime | None,
+]
 
 
 class _RowResult:
@@ -52,6 +61,16 @@ class _RowResult:
 
     def one_or_none(self) -> _ClaimRow | None:
         return self._row
+
+
+class _RowsResult:
+    """Minimal row-result double for an expired execution projection."""
+
+    def __init__(self, rows: tuple[_ExpiredExecutionRow, ...]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[_ExpiredExecutionRow]:
+        return list(self._rows)
 
 
 def _session(
@@ -88,6 +107,148 @@ def _mutation_session(stored_task_id: UUID | None) -> Mock:
         commit=AsyncMock(),
         rollback=AsyncMock(),
     )
+
+
+def _expired_execution_session(
+    rows: tuple[_ExpiredExecutionRow, ...],
+) -> tuple[AsyncSession, AsyncMock, Mock, AsyncMock, AsyncMock]:
+    execute = AsyncMock(return_value=_RowsResult(rows))
+    begin = Mock()
+    commit = AsyncMock()
+    rollback = AsyncMock()
+    session = cast(
+        AsyncSession,
+        Mock(execute=execute, begin=begin, commit=commit, rollback=rollback),
+    )
+    return session, execute, begin, commit, rollback
+
+
+@pytest.mark.asyncio
+async def test_expired_batch_locks_oldest_executions_and_returns_frozen_snapshots() -> None:
+    """Recovery receives only the projected state while its caller retains row locks."""
+
+    second_task_id = UUID("10000000-0000-4000-8000-000000000002")
+    second_execution_token = UUID("30000000-0000-4000-8000-000000000004")
+    second_lease_expires_at = _LEASE_EXPIRES_AT + timedelta(seconds=1)
+    rows: tuple[_ExpiredExecutionRow, ...] = (
+        (_TASK_ID, TaskPriority.HIGH, 1, 3, _EXECUTION_TOKEN, _LEASE_EXPIRES_AT),
+        (
+            second_task_id,
+            TaskPriority.LOW,
+            2,
+            3,
+            second_execution_token,
+            second_lease_expires_at,
+        ),
+    )
+    session, execute, begin, commit, rollback = _expired_execution_session(rows)
+
+    locked = await TaskExecutionRepository(session).lock_expired_execution_batch(batch_size=2)
+
+    assert locked == (
+        LockedExpiredTaskExecution(
+            task_id=_TASK_ID,
+            priority=TaskPriority.HIGH,
+            attempt_count=1,
+            max_attempts=3,
+            execution_token=_EXECUTION_TOKEN,
+            lease_expires_at=_LEASE_EXPIRES_AT,
+        ),
+        LockedExpiredTaskExecution(
+            task_id=second_task_id,
+            priority=TaskPriority.LOW,
+            attempt_count=2,
+            max_attempts=3,
+            execution_token=second_execution_token,
+            lease_expires_at=second_lease_expires_at,
+        ),
+    )
+    with pytest.raises(FrozenInstanceError):
+        locked[0].attempt_count = 2  # type: ignore[misc]
+
+    execute.assert_awaited_once()
+    assert execute.await_args is not None
+    statement = execute.await_args.args[0]
+    sql = _compiled_sql(statement)
+    assert sql.startswith(
+        "SELECT tasks.id, tasks.priority, tasks.attempt_count, tasks.max_attempts, "
+        "tasks.execution_token, tasks.lease_expires_at FROM tasks"
+    )
+    assert "tasks.status =" in sql
+    assert "tasks.lease_expires_at <= statement_timestamp()" in sql
+    assert "ORDER BY tasks.lease_expires_at, tasks.id" in sql
+    assert " LIMIT " in sql
+    assert sql.endswith("FOR UPDATE OF tasks SKIP LOCKED")
+
+    parameters = _compiled_parameters(statement)
+    assert parameters["status_1"] is TaskStatus.IN_PROGRESS
+    assert 2 in parameters.values()
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_batch_returns_empty_when_no_execution_is_eligible() -> None:
+    """An idle recovery pass acquires no task state or transaction ownership."""
+
+    session, execute, begin, commit, rollback = _expired_execution_session(())
+
+    locked = await TaskExecutionRepository(session).lock_expired_execution_batch(batch_size=10)
+
+    assert locked == ()
+    execute.assert_awaited_once()
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+@pytest.mark.asyncio
+async def test_expired_batch_rejects_a_non_positive_limit_before_database_access(
+    batch_size: int,
+) -> None:
+    """Recovery cannot accidentally acquire an unbounded set of task locks."""
+
+    session, execute, begin, commit, rollback = _expired_execution_session(())
+
+    with pytest.raises(ValueError, match=r"^batch_size must be at least 1$"):
+        await TaskExecutionRepository(session).lock_expired_execution_batch(batch_size=batch_size)
+
+    execute.assert_not_awaited()
+    begin.assert_not_called()
+    commit.assert_not_awaited()
+    rollback.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("execution_token", "lease_expires_at"),
+    [(None, _LEASE_EXPIRES_AT), (_EXECUTION_TOKEN, None)],
+)
+@pytest.mark.asyncio
+async def test_expired_batch_rejects_a_row_without_complete_execution_ownership(
+    execution_token: UUID | None,
+    lease_expires_at: datetime | None,
+) -> None:
+    """A broken database invariant aborts the surrounding recovery transaction."""
+
+    row: _ExpiredExecutionRow = (
+        _TASK_ID,
+        TaskPriority.HIGH,
+        1,
+        3,
+        execution_token,
+        lease_expires_at,
+    )
+    session, execute, _, _, _ = _expired_execution_session((row,))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^expired task execution is missing its lease$",
+    ):
+        await TaskExecutionRepository(session).lock_expired_execution_batch(batch_size=1)
+
+    execute.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

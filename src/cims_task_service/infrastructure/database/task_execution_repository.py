@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.domain.task import TaskPriority, TaskStatus
@@ -22,6 +22,18 @@ class ClaimedTaskExecution:
     task_id: UUID
     name: str
     description: str
+    priority: TaskPriority
+    attempt_count: int
+    max_attempts: int
+    execution_token: UUID
+    lease_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class LockedExpiredTaskExecution:
+    """Expired execution whose task row stays locked by the caller's transaction."""
+
+    task_id: UUID
     priority: TaskPriority
     attempt_count: int
     max_attempts: int
@@ -102,6 +114,61 @@ class TaskExecutionRepository:
             execution_token=stored_execution_token,
             lease_expires_at=lease_expires_at,
         )
+
+    async def lock_expired_execution_batch(
+        self,
+        *,
+        batch_size: int,
+    ) -> tuple[LockedExpiredTaskExecution, ...]:
+        """Lock the oldest expired executions for processing in the same transaction."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        statement = (
+            select(
+                TaskModel.id,
+                TaskModel.priority,
+                TaskModel.attempt_count,
+                TaskModel.max_attempts,
+                TaskModel.execution_token,
+                TaskModel.lease_expires_at,
+            )
+            .where(
+                TaskModel.status == TaskStatus.IN_PROGRESS,
+                TaskModel.lease_expires_at <= func.statement_timestamp(),
+            )
+            .order_by(TaskModel.lease_expires_at, TaskModel.id)
+            .limit(batch_size)
+            .with_for_update(of=TaskModel, skip_locked=True)
+        )
+        rows = (await self._session.execute(statement)).all()
+
+        locked_executions: list[LockedExpiredTaskExecution] = []
+        for row in rows:
+            (
+                task_id,
+                priority,
+                attempt_count,
+                max_attempts,
+                execution_token,
+                lease_expires_at,
+            ) = row
+            if execution_token is None or lease_expires_at is None:
+                raise RuntimeError("expired task execution is missing its lease")
+
+            locked_executions.append(
+                LockedExpiredTaskExecution(
+                    task_id=task_id,
+                    priority=priority,
+                    attempt_count=attempt_count,
+                    max_attempts=max_attempts,
+                    execution_token=execution_token,
+                    lease_expires_at=lease_expires_at,
+                )
+            )
+
+        return tuple(locked_executions)
 
     async def renew_execution_lease(
         self,

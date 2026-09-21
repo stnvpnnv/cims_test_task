@@ -16,6 +16,7 @@ from cims_task_service.infrastructure.database.models import JsonObject, OutboxE
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 from cims_task_service.infrastructure.database.task_execution_repository import (
     ClaimedTaskExecution,
+    LockedExpiredTaskExecution,
     TaskExecutionRepository,
 )
 from cims_task_service.infrastructure.database.task_repository import TaskRepository
@@ -33,6 +34,28 @@ _RESULT: JsonObject = {
 _ERROR: JsonObject = {"code": "PROCESSING_FAILED", "retryable": False}
 
 type ExecutionOperation = Literal["completion", "failure", "retry", "renewal"]
+
+
+def _execution_candidate(
+    *,
+    task_number: int,
+    lease_expires_at: datetime,
+    priority: TaskPriority = TaskPriority.HIGH,
+    attempt_count: int = 1,
+) -> TaskModel:
+    return TaskModel(
+        id=UUID(int=task_number),
+        name="Recovery candidate",
+        description="Execution lease selection fixture",
+        priority=priority,
+        status=TaskStatus.IN_PROGRESS,
+        created_at=lease_expires_at - timedelta(hours=2),
+        started_at=lease_expires_at - timedelta(hours=1),
+        attempt_count=attempt_count,
+        max_attempts=3,
+        execution_token=UUID(int=task_number + 100),
+        lease_expires_at=lease_expires_at,
+    )
 
 
 async def _create_pending_task(
@@ -882,3 +905,183 @@ async def test_waiting_operation_observes_the_committed_retry(
         assert stored.dispatch_token == retry_dispatch_token
         assert stored.finished_at is None
         assert retry_event.discarded_at is None
+
+
+async def test_expired_execution_batch_is_ordered_bounded_and_read_only(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Only expired executions are locked, including the final permitted attempt."""
+
+    async with postgres_session_factory.begin() as session:
+        now = await session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        candidates = [
+            _execution_candidate(task_number=1, lease_expires_at=now - timedelta(seconds=30)),
+            _execution_candidate(
+                task_number=3,
+                lease_expires_at=now - timedelta(minutes=1),
+                attempt_count=3,
+            ),
+            _execution_candidate(
+                task_number=2,
+                lease_expires_at=now - timedelta(minutes=1),
+                priority=TaskPriority.MEDIUM,
+                attempt_count=2,
+            ),
+            _execution_candidate(
+                task_number=4,
+                lease_expires_at=now - timedelta(minutes=2),
+                priority=TaskPriority.LOW,
+            ),
+            _execution_candidate(task_number=5, lease_expires_at=now + timedelta(hours=1)),
+        ]
+        for task_number, status in enumerate(
+            (
+                TaskStatus.NEW,
+                TaskStatus.PENDING,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ),
+            start=6,
+        ):
+            candidate = _execution_candidate(task_number=task_number, lease_expires_at=now)
+            candidate.status = status
+            candidate.execution_token = None
+            candidate.lease_expires_at = None
+            if status in (TaskStatus.NEW, TaskStatus.PENDING):
+                candidate.attempt_count = 0
+                candidate.started_at = None
+                candidate.dispatch_token = UUID(int=task_number + 200)
+            else:
+                candidate.finished_at = now
+            candidates.append(candidate)
+        session.add_all(candidates)
+        await session.flush()
+        session.add(
+            OutboxEventModel(
+                task_id=UUID(int=4),
+                event_type=TASK_ROUTING_KEY,
+                payload={"task_id": str(UUID(int=4)), "dispatch_token": str(UUID(int=204))},
+                message_priority=1,
+            )
+        )
+
+    tasks_statement = select(TaskModel.__table__).order_by(TaskModel.id)
+    events_statement = select(OutboxEventModel.__table__).order_by(OutboxEventModel.id)
+    async with postgres_session_factory.begin() as session:
+        original_tasks = (await session.execute(tasks_statement)).all()
+        original_events = (await session.execute(events_statement)).all()
+        repository = TaskExecutionRepository(session)
+        batch = await repository.lock_expired_execution_batch(batch_size=3)
+        assert tuple(item.task_id for item in batch) == tuple(UUID(int=i) for i in (4, 2, 3))
+        for locked, expected in zip(
+            batch, (candidates[3], candidates[2], candidates[1]), strict=True
+        ):
+            assert expected.execution_token is not None
+            assert expected.lease_expires_at is not None
+            assert locked == LockedExpiredTaskExecution(
+                task_id=expected.id,
+                priority=expected.priority,
+                attempt_count=expected.attempt_count,
+                max_attempts=expected.max_attempts,
+                execution_token=expected.execution_token,
+                lease_expires_at=expected.lease_expires_at,
+            )
+        full_batch = await repository.lock_expired_execution_batch(batch_size=20)
+        assert tuple(item.task_id for item in full_batch) == tuple(
+            UUID(int=i) for i in (4, 2, 3, 1)
+        )
+
+    async with postgres_session_factory() as session:
+        assert (await session.execute(tasks_statement)).all() == original_tasks
+        assert (await session.execute(events_statement)).all() == original_events
+
+
+async def test_expired_execution_batches_skip_locks_until_the_caller_releases_them(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """Concurrent recovery transactions receive disjoint rows without waiting for locks."""
+
+    async with postgres_session_factory.begin() as session:
+        now = await session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        session.add_all(_execution_candidate(task_number=i, lease_expires_at=now) for i in (2, 1))
+
+    async with (
+        postgres_session_factory() as first,
+        postgres_session_factory() as second,
+        postgres_session_factory() as observer,
+        first.begin() as first_transaction,
+        second.begin() as second_transaction,
+        observer.begin() as observer_transaction,
+    ):
+        backend_ids = {
+            await session.scalar(text("SELECT pg_backend_pid()"))
+            for session in (first, second, observer)
+        }
+        assert len(backend_ids) == 3
+        first_batch = await TaskExecutionRepository(first).lock_expired_execution_batch(
+            batch_size=1
+        )
+        assert tuple(item.task_id for item in first_batch) == (UUID(int=1),)
+        async with asyncio.timeout(10):
+            second_batch = await TaskExecutionRepository(second).lock_expired_execution_batch(
+                batch_size=1
+            )
+            assert tuple(item.task_id for item in second_batch) == (UUID(int=2),)
+            assert (
+                await TaskExecutionRepository(observer).lock_expired_execution_batch(batch_size=2)
+                == ()
+            )
+
+        await first_transaction.rollback()
+        async with asyncio.timeout(10):
+            released_batch = await TaskExecutionRepository(observer).lock_expired_execution_batch(
+                batch_size=2
+            )
+        assert released_batch == first_batch
+        await observer_transaction.commit()
+        await second_transaction.commit()
+
+    async with postgres_session_factory.begin() as session:
+        released = await TaskExecutionRepository(session).lock_expired_execution_batch(batch_size=2)
+    assert released == (*first_batch, *second_batch)
+
+
+async def test_expired_execution_locked_by_renewal_is_skipped_and_then_filtered_out(
+    postgres_session_factory: AsyncSessionFactory,
+) -> None:
+    """A heartbeat holding a task lock cannot be overtaken by expired-lease selection."""
+
+    async with postgres_session_factory.begin() as session:
+        now = await session.scalar(select(func.clock_timestamp()))
+        assert isinstance(now, datetime)
+        candidate = _execution_candidate(task_number=1, lease_expires_at=now)
+        session.add(candidate)
+    assert candidate.execution_token is not None
+
+    async with (
+        postgres_session_factory() as renewing,
+        postgres_session_factory() as recovering,
+        renewing.begin() as renewing_transaction,
+        recovering.begin(),
+    ):
+        assert await renewing.scalar(text("SELECT pg_backend_pid()")) != await recovering.scalar(
+            text("SELECT pg_backend_pid()")
+        )
+        assert await TaskExecutionRepository(renewing).renew_execution_lease(
+            candidate.id,
+            execution_token=candidate.execution_token,
+            lease_duration=timedelta(hours=1),
+        )
+        async with asyncio.timeout(10):
+            assert (
+                await TaskExecutionRepository(recovering).lock_expired_execution_batch(batch_size=1)
+                == ()
+            )
+        await renewing_transaction.commit()
+        assert (
+            await TaskExecutionRepository(recovering).lock_expired_execution_batch(batch_size=1)
+            == ()
+        )

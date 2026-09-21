@@ -1,6 +1,9 @@
 """RabbitMQ topology for task execution."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Final
 
 from aio_pika import ExchangeType
 from aio_pika.abc import (
@@ -9,6 +12,8 @@ from aio_pika.abc import (
     AbstractRobustQueue,
 )
 
+from cims_task_service.domain.task import TaskPriority
+
 TASK_EXCHANGE_NAME = "cims.tasks"
 TASK_QUEUE_NAME = "cims.tasks.execute.v1"
 TASK_ROUTING_KEY = "task.execute.v1"
@@ -16,6 +21,20 @@ TASK_ROUTING_KEY = "task.execute.v1"
 DEAD_LETTER_EXCHANGE_NAME = "cims.tasks.dead-letter"
 DEAD_LETTER_QUEUE_NAME = "cims.tasks.dead-letter.v1"
 DEAD_LETTER_ROUTING_KEY = "task.dead-letter.v1"
+
+_TASK_MESSAGE_PRIORITIES: Final[Mapping[TaskPriority, int]] = MappingProxyType(
+    {
+        TaskPriority.LOW: 1,
+        TaskPriority.MEDIUM: 2,
+        TaskPriority.HIGH: 3,
+    }
+)
+
+
+def task_message_priority(priority: TaskPriority) -> int:
+    """Translate the domain priority into RabbitMQ message metadata."""
+
+    return _TASK_MESSAGE_PRIORITIES[priority]
 
 
 @dataclass(frozen=True, slots=True)

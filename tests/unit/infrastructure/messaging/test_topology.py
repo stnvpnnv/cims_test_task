@@ -12,6 +12,7 @@ from aio_pika.abc import (
     AbstractRobustQueue,
 )
 
+from cims_task_service.domain.task import TaskPriority
 from cims_task_service.infrastructure.messaging.topology import (
     DEAD_LETTER_EXCHANGE_NAME,
     DEAD_LETTER_QUEUE_NAME,
@@ -20,7 +21,25 @@ from cims_task_service.infrastructure.messaging.topology import (
     TASK_QUEUE_NAME,
     TASK_ROUTING_KEY,
     declare_task_topology,
+    task_message_priority,
 )
+
+
+@pytest.mark.parametrize(
+    ("priority", "message_priority"),
+    [
+        (TaskPriority.LOW, 1),
+        (TaskPriority.MEDIUM, 2),
+        (TaskPriority.HIGH, 3),
+    ],
+)
+def test_task_priority_maps_to_stable_rabbitmq_metadata(
+    priority: TaskPriority,
+    message_priority: int,
+) -> None:
+    """Creation and recovery share one broker-priority contract."""
+
+    assert task_message_priority(priority) == message_priority
 
 
 @pytest.mark.asyncio

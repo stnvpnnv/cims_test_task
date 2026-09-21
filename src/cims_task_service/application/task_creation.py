@@ -1,9 +1,6 @@
 """Transactional task creation application service."""
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Final
 from uuid import UUID
 
 from cims_task_service.application.idempotency import (
@@ -14,14 +11,9 @@ from cims_task_service.domain.task import TaskPriority
 from cims_task_service.infrastructure.database.models import TaskModel
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 from cims_task_service.infrastructure.database.task_repository import TaskRepository
-from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
-
-_MESSAGE_PRIORITIES: Final[Mapping[TaskPriority, int]] = MappingProxyType(
-    {
-        TaskPriority.LOW: 1,
-        TaskPriority.MEDIUM: 2,
-        TaskPriority.HIGH: 3,
-    }
+from cims_task_service.infrastructure.messaging.topology import (
+    TASK_ROUTING_KEY,
+    task_message_priority,
 )
 
 
@@ -82,7 +74,7 @@ async def create_task(
             idempotency_key_hash=idempotency_key_hash,
             request_fingerprint=request_fingerprint,
             event_type=TASK_ROUTING_KEY,
-            message_priority=_MESSAGE_PRIORITIES[command.priority],
+            message_priority=task_message_priority(command.priority),
         )
         if not stored.created and stored.task.request_fingerprint != request_fingerprint:
             raise IdempotencyKeyConflictError(stored.task.id)

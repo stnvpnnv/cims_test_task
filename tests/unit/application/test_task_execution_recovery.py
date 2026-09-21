@@ -1,9 +1,11 @@
 """Tests for atomic recovery of expired task executions."""
 
+import asyncio
+from contextlib import suppress
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 from unittest.mock import AsyncMock, Mock, call
 from uuid import UUID
 
@@ -16,6 +18,7 @@ from cims_task_service.application.task_execution_recovery import (
     ExecutionRecoveryInvariantError,
     RecoveryBatchResult,
     TaskExecutionRecovery,
+    run_execution_recovery_loop,
 )
 from cims_task_service.domain.task import TaskPriority
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
@@ -25,6 +28,12 @@ from cims_task_service.infrastructure.database.task_execution_repository import 
 from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 
 _LEASE_EXPIRES_AT = datetime(2026, 9, 21, 1, tzinfo=UTC)
+
+
+async def _cancel_and_wait[T](task: asyncio.Task[T]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,3 +284,310 @@ async def test_recovery_rolls_back_if_locked_ownership_is_unexpectedly_lost(
     exception = harness.transaction.__aexit__.await_args.args
     assert exception[0] is ExecutionRecoveryInvariantError
     assert exception[1] is error_info.value
+
+
+@pytest.mark.parametrize(
+    "poll_interval_seconds",
+    [0.0, -0.1, float("nan"), float("inf"), float("-inf")],
+)
+@pytest.mark.asyncio
+async def test_recovery_loop_rejects_an_invalid_poll_interval_before_recovery(
+    poll_interval_seconds: float,
+) -> None:
+    """Invalid timing cannot reach the database even when already stopped."""
+
+    recover_once = AsyncMock()
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    with pytest.raises(
+        ValueError,
+        match=r"^poll_interval_seconds must be finite and positive$",
+    ):
+        await run_execution_recovery_loop(
+            recover_once,
+            stop_event=stop_event,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+    recover_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_does_not_recover_when_already_stopped() -> None:
+    """A pre-existing shutdown request prevents a new transaction."""
+
+    recover_once = AsyncMock()
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await run_execution_recovery_loop(
+        recover_once,
+        stop_event=stop_event,
+        poll_interval_seconds=1.0,
+    )
+
+    recover_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_drains_nonempty_batches_before_idle_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backlogged work is processed sequentially without a polling delay."""
+
+    stop_event = asyncio.Event()
+    recover_once = AsyncMock(
+        side_effect=[
+            RecoveryBatchResult(locked=2, retried=2, failed=0),
+            RecoveryBatchResult(locked=1, retried=0, failed=1),
+            RecoveryBatchResult(locked=0, retried=0, failed=0),
+        ]
+    )
+
+    async def request_stop(
+        received_stop_event: asyncio.Event,
+        *,
+        poll_interval_seconds: float,
+    ) -> None:
+        assert received_stop_event is stop_event
+        assert poll_interval_seconds == 0.25
+        stop_event.set()
+
+    wait_for_stop = AsyncMock(side_effect=request_stop)
+    monkeypatch.setattr(recovery_module, "_wait_for_recovery_stop", wait_for_stop)
+
+    await run_execution_recovery_loop(
+        recover_once,
+        stop_event=stop_event,
+        poll_interval_seconds=0.25,
+    )
+
+    assert recover_once.await_count == 3
+    wait_for_stop.assert_awaited_once_with(
+        stop_event,
+        poll_interval_seconds=0.25,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_event_wakes_the_production_recovery_idle_wait() -> None:
+    """Shutdown interrupts an idle wait without starting another recovery pass."""
+
+    recovery_started = asyncio.Event()
+    stop_event = asyncio.Event()
+
+    async def recover_once() -> RecoveryBatchResult:
+        recovery_started.set()
+        return RecoveryBatchResult(locked=0, retried=0, failed=0)
+
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            recover_once,
+            stop_event=stop_event,
+            poll_interval_seconds=60.0,
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            await recovery_started.wait()
+        stop_event.set()
+        async with asyncio.timeout(1):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+
+@pytest.mark.asyncio
+async def test_recovery_idle_deadline_triggers_the_next_poll() -> None:
+    """An expired idle interval starts exactly one subsequent pass."""
+
+    stop_event = asyncio.Event()
+    recovery_calls = 0
+
+    async def recover_once() -> RecoveryBatchResult:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        if recovery_calls == 2:
+            stop_event.set()
+        return RecoveryBatchResult(locked=0, retried=0, failed=0)
+
+    async with asyncio.timeout(1):
+        await run_execution_recovery_loop(
+            recover_once,
+            stop_event=stop_event,
+            poll_interval_seconds=0.001,
+        )
+
+    assert recovery_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_recovery_idle_wait_does_not_swallow_an_unrelated_timeout() -> None:
+    """Only expiration of the loop's own deadline is treated as normal polling."""
+
+    expected_error = TimeoutError("event wait failed")
+
+    class FailingStopEvent(asyncio.Event):
+        async def wait(self) -> Literal[True]:
+            raise expected_error
+
+    recover_once = AsyncMock(return_value=RecoveryBatchResult(locked=0, retried=0, failed=0))
+
+    with pytest.raises(TimeoutError) as error_info:
+        await run_execution_recovery_loop(
+            recover_once,
+            stop_event=FailingStopEvent(),
+            poll_interval_seconds=60.0,
+        )
+
+    assert error_info.value is expected_error
+    recover_once.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_active_recovery_finishes_it_without_another_pass() -> None:
+    """Graceful shutdown lets the current transaction complete exactly once."""
+
+    recovery_started = asyncio.Event()
+    finish_recovery = asyncio.Event()
+    stop_event = asyncio.Event()
+    recovery_calls = 0
+
+    async def recover_once() -> RecoveryBatchResult:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        recovery_started.set()
+        await finish_recovery.wait()
+        return RecoveryBatchResult(locked=1, retried=1, failed=0)
+
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            recover_once,
+            stop_event=stop_event,
+            poll_interval_seconds=1.0,
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            await recovery_started.wait()
+        stop_event.set()
+        assert not loop_task.done()
+        finish_recovery.set()
+        async with asyncio.timeout(1):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+    assert recovery_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_terminates_the_loop() -> None:
+    """Unexpected failures retain their identity for process supervision."""
+
+    expected_error = RuntimeError("recovery failed")
+    recover_once = AsyncMock(side_effect=expected_error)
+
+    with pytest.raises(RuntimeError) as error_info:
+        await run_execution_recovery_loop(
+            recover_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=1.0,
+        )
+
+    assert error_info.value is expected_error
+
+
+@pytest.mark.asyncio
+async def test_recovery_timeout_is_not_mistaken_for_an_idle_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A database timeout terminates the loop instead of becoming a repoll."""
+
+    expected_error = TimeoutError("recovery timed out")
+    recover_once = AsyncMock(side_effect=expected_error)
+    wait_for_stop = AsyncMock()
+    monkeypatch.setattr(recovery_module, "_wait_for_recovery_stop", wait_for_stop)
+
+    with pytest.raises(TimeoutError) as error_info:
+        await run_execution_recovery_loop(
+            recover_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=1.0,
+        )
+
+    assert error_info.value is expected_error
+    wait_for_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_idle_recovery_loop_propagates() -> None:
+    """External cancellation interrupts the production idle wait unchanged."""
+
+    class ObservedStopEvent(asyncio.Event):
+        def __init__(self) -> None:
+            super().__init__()
+            self.wait_started = asyncio.Event()
+
+        async def wait(self) -> Literal[True]:
+            self.wait_started.set()
+            return await super().wait()
+
+    stop_event = ObservedStopEvent()
+    recover_once = AsyncMock(return_value=RecoveryBatchResult(locked=0, retried=0, failed=0))
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            recover_once,
+            stop_event=stop_event,
+            poll_interval_seconds=60.0,
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            await stop_event.wait_started.wait()
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+    recover_once.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_active_recovery_propagates_into_the_current_pass() -> None:
+    """Forced shutdown cannot orphan a recovery transaction."""
+
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+
+    async def recover_once() -> RecoveryBatchResult:
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            recovery_cancelled.set()
+        raise AssertionError("unreachable")
+
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            recover_once,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=1.0,
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            await recovery_started.wait()
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+    assert recovery_cancelled.is_set()

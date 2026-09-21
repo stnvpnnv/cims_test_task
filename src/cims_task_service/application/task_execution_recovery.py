@@ -1,8 +1,10 @@
 """Atomic recovery of task executions abandoned by workers."""
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from math import isfinite
 from typing import Final
 from uuid import UUID
 
@@ -29,6 +31,9 @@ class RecoveryBatchResult:
     locked: int
     retried: int
     failed: int
+
+
+type RecoverOnce = Callable[[], Awaitable[RecoveryBatchResult]]
 
 
 class ExecutionRecoveryInvariantError(RuntimeError):
@@ -112,6 +117,43 @@ class TaskExecutionRecovery:
             retry_delays[execution.task_id] = retry_delay
 
         return retry_delays
+
+
+async def run_execution_recovery_loop(
+    recover_once: RecoverOnce,
+    *,
+    stop_event: asyncio.Event,
+    poll_interval_seconds: float,
+) -> None:
+    """Drain expired executions and wait interruptibly while recovery is idle."""
+
+    if not isfinite(poll_interval_seconds) or poll_interval_seconds <= 0:
+        raise ValueError("poll_interval_seconds must be finite and positive")
+
+    while not stop_event.is_set():
+        result = await recover_once()
+        if stop_event.is_set():
+            return
+        if result.locked > 0:
+            continue
+        await _wait_for_recovery_stop(
+            stop_event,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
+
+async def _wait_for_recovery_stop(
+    stop_event: asyncio.Event,
+    *,
+    poll_interval_seconds: float,
+) -> None:
+    idle_timeout = asyncio.timeout(poll_interval_seconds)
+    try:
+        async with idle_timeout:
+            await stop_event.wait()
+    except TimeoutError:
+        if not idle_timeout.expired():
+            raise
 
 
 def _execution_lease_expired_error() -> JsonObject:

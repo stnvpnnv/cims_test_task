@@ -4,6 +4,9 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 from cims_task_service.application.task_dispatcher import MAX_DISPATCH_BATCH_SIZE
+from cims_task_service.application.task_execution_recovery import (
+    MAX_RECOVERY_BATCH_SIZE,
+)
 from cims_task_service.config import DispatcherSettings, Settings
 
 _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
@@ -13,6 +16,9 @@ _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS",
     "CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS",
     "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
+    "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
+    "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
+    "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
 )
 
 _SETTINGS_ENVIRONMENT_VARIABLES = (
@@ -27,6 +33,7 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS",
     "CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS",
     "CIMS_DISPATCHER_BATCH_SIZE",
+    "CIMS_EXECUTION_RECOVERY_BATCH_SIZE",
     *_DISPATCHER_DURATION_ENVIRONMENT_VARIABLES,
 )
 
@@ -107,6 +114,10 @@ def test_dispatcher_settings_have_coherent_defaults() -> None:
     assert settings.dispatcher_retry_maximum_delay_seconds == 60.0
     assert settings.rabbitmq_publish_timeout_seconds == 10.0
     assert settings.dispatcher_shutdown_grace_seconds == 45.0
+    assert settings.execution_recovery_batch_size == 10
+    assert settings.execution_recovery_poll_interval_seconds == 5.0
+    assert settings.execution_retry_initial_delay_seconds == 5.0
+    assert settings.execution_retry_maximum_delay_seconds == 300.0
 
 
 def test_dispatcher_settings_load_environment_overrides(
@@ -121,6 +132,10 @@ def test_dispatcher_settings_load_environment_overrides(
     monkeypatch.setenv("CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS", "90")
     monkeypatch.setenv("CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS", "12")
     monkeypatch.setenv("CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS", "20")
+    monkeypatch.setenv("CIMS_EXECUTION_RECOVERY_BATCH_SIZE", "8")
+    monkeypatch.setenv("CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS", "4.5")
+    monkeypatch.setenv("CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS", "7.5")
+    monkeypatch.setenv("CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS", "240")
 
     settings = DispatcherSettings()
 
@@ -131,6 +146,10 @@ def test_dispatcher_settings_load_environment_overrides(
     assert settings.dispatcher_retry_maximum_delay_seconds == 90.0
     assert settings.rabbitmq_publish_timeout_seconds == 12.0
     assert settings.dispatcher_shutdown_grace_seconds == 20.0
+    assert settings.execution_recovery_batch_size == 8
+    assert settings.execution_recovery_poll_interval_seconds == 4.5
+    assert settings.execution_retry_initial_delay_seconds == 7.5
+    assert settings.execution_retry_maximum_delay_seconds == 240.0
 
 
 @pytest.mark.parametrize(
@@ -160,6 +179,22 @@ def test_dispatcher_settings_load_environment_overrides(
         (
             "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
             "dispatcher_shutdown_grace_seconds",
+        ),
+        (
+            "CIMS_EXECUTION_RECOVERY_BATCH_SIZE",
+            "execution_recovery_batch_size",
+        ),
+        (
+            "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
+            "execution_recovery_poll_interval_seconds",
+        ),
+        (
+            "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
+            "execution_retry_initial_delay_seconds",
+        ),
+        (
+            "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
+            "execution_retry_maximum_delay_seconds",
         ),
     ],
 )
@@ -362,6 +397,31 @@ def test_dispatcher_batch_size_rejects_invalid_values(
         DispatcherSettings()
 
 
+@pytest.mark.parametrize("batch_size", [1, MAX_RECOVERY_BATCH_SIZE])
+def test_execution_recovery_batch_size_accepts_boundaries(batch_size: int) -> None:
+    """Configuration and recovery transaction limits remain synchronized."""
+
+    settings = DispatcherSettings(execution_recovery_batch_size=batch_size)
+
+    assert settings.execution_recovery_batch_size == batch_size
+
+
+@pytest.mark.parametrize(
+    "invalid_batch_size",
+    ["0", "-1", "1.5", str(MAX_RECOVERY_BATCH_SIZE + 1)],
+)
+def test_execution_recovery_batch_size_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_batch_size: str,
+) -> None:
+    """Recovery cannot receive an invalid or unbounded transaction size."""
+
+    monkeypatch.setenv("CIMS_EXECUTION_RECOVERY_BATCH_SIZE", invalid_batch_size)
+
+    with pytest.raises(ValidationError):
+        DispatcherSettings()
+
+
 @pytest.mark.parametrize("variable_name", _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES)
 @pytest.mark.parametrize("invalid_value", ["0", "-0.1"])
 def test_dispatcher_durations_must_be_positive(
@@ -414,6 +474,56 @@ def test_dispatcher_retry_delay_allows_a_fixed_cap() -> None:
     )
 
     assert settings.dispatcher_retry_maximum_delay_seconds == 2.0
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "execution_retry_initial_delay_seconds",
+        "execution_retry_maximum_delay_seconds",
+    ],
+)
+def test_execution_retry_delay_rejects_values_above_one_day(
+    field_name: str,
+) -> None:
+    """Execution recovery cannot schedule unexpectedly distant retries."""
+
+    with pytest.raises(ValidationError):
+        DispatcherSettings.model_validate({field_name: 86_400.000_001})
+
+
+def test_execution_retry_maximum_must_cover_the_initial_delay() -> None:
+    """An execution backoff cannot start above its own maximum."""
+
+    with pytest.raises(ValidationError, match="execution retry maximum delay"):
+        DispatcherSettings(
+            execution_retry_initial_delay_seconds=2.0,
+            execution_retry_maximum_delay_seconds=1.0,
+        )
+
+
+def test_execution_retry_delay_allows_a_fixed_cap() -> None:
+    """Equal bounds intentionally produce a capped jitter-only retry delay."""
+
+    settings = DispatcherSettings(
+        execution_retry_initial_delay_seconds=2.0,
+        execution_retry_maximum_delay_seconds=2.0,
+    )
+
+    assert settings.execution_retry_initial_delay_seconds == 2.0
+    assert settings.execution_retry_maximum_delay_seconds == 2.0
+
+
+def test_execution_retry_delay_accepts_one_day_limit() -> None:
+    """The documented upper bound itself remains a valid deployment value."""
+
+    settings = DispatcherSettings(
+        execution_retry_initial_delay_seconds=86_400.0,
+        execution_retry_maximum_delay_seconds=86_400.0,
+    )
+
+    assert settings.execution_retry_initial_delay_seconds == 86_400.0
+    assert settings.execution_retry_maximum_delay_seconds == 86_400.0
 
 
 def test_dispatcher_batch_must_fit_the_database_pool() -> None:
@@ -476,6 +586,22 @@ def test_dispatcher_rejects_durations_that_round_to_zero(
         ValidationError,
         match=("dispatcher lease and retry durations must resolve to at least one microsecond"),
     ):
+        DispatcherSettings.model_validate({field_name: 1e-10})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "execution_retry_initial_delay_seconds",
+        "execution_retry_maximum_delay_seconds",
+    ],
+)
+def test_execution_retry_rejects_durations_that_round_to_zero(
+    field_name: str,
+) -> None:
+    """Execution retry durations remain positive after timedelta conversion."""
+
+    with pytest.raises(ValidationError, match="execution retry delays"):
         DispatcherSettings.model_validate({field_name: 1e-10})
 
 

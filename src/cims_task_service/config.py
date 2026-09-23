@@ -1,7 +1,7 @@
 """Runtime configuration loaded from environment variables."""
 
 from datetime import timedelta
-from typing import Annotated, Self
+from typing import Annotated, Final, Self
 
 from pydantic import (
     AnyUrl,
@@ -26,6 +26,7 @@ type _AmqpUrl = Annotated[
 ]
 
 _AMQP_URL_ADAPTER: TypeAdapter[_AmqpUrl] = TypeAdapter(_AmqpUrl)
+MAX_EXECUTION_RETRY_DELAY_SECONDS: Final = 86_400.0
 
 
 class Settings(BaseSettings):
@@ -83,7 +84,7 @@ class Settings(BaseSettings):
 
 
 class DispatcherSettings(Settings):
-    """Settings used only by the independently deployed dispatcher process."""
+    """Settings used only by the independently deployed background process."""
 
     dispatcher_batch_size: Annotated[int, Field(ge=1, le=100)] = 10
     dispatcher_poll_interval_seconds: PositiveFloat = 0.5
@@ -92,6 +93,16 @@ class DispatcherSettings(Settings):
     dispatcher_retry_maximum_delay_seconds: PositiveFloat = 60.0
     rabbitmq_publish_timeout_seconds: PositiveFloat = 10.0
     dispatcher_shutdown_grace_seconds: PositiveFloat = 45.0
+    execution_recovery_batch_size: Annotated[int, Field(ge=1, le=100)] = 10
+    execution_recovery_poll_interval_seconds: PositiveFloat = 5.0
+    execution_retry_initial_delay_seconds: Annotated[
+        float,
+        Field(gt=0, le=MAX_EXECUTION_RETRY_DELAY_SECONDS),
+    ] = 5.0
+    execution_retry_maximum_delay_seconds: Annotated[
+        float,
+        Field(gt=0, le=MAX_EXECUTION_RETRY_DELAY_SECONDS),
+    ] = 300.0
 
     @model_validator(mode="after")
     def require_coherent_dispatcher_policy(self) -> Self:
@@ -129,6 +140,23 @@ class DispatcherSettings(Settings):
 
         if lease_duration <= required_lease_duration:
             message = "dispatcher lease duration must exceed the publish and database pool timeouts"
+            raise ValueError(message)
+
+        return self
+
+    @model_validator(mode="after")
+    def require_coherent_execution_recovery_policy(self) -> Self:
+        """Reject execution retry delays that cannot form a safe schedule."""
+
+        retry_initial_delay = timedelta(seconds=self.execution_retry_initial_delay_seconds)
+        retry_maximum_delay = timedelta(seconds=self.execution_retry_maximum_delay_seconds)
+
+        if retry_initial_delay <= timedelta(0) or retry_maximum_delay <= timedelta(0):
+            message = "execution retry delays must resolve to at least one microsecond"
+            raise ValueError(message)
+
+        if retry_maximum_delay < retry_initial_delay:
+            message = "execution retry maximum delay must be at least its initial delay"
             raise ValueError(message)
 
         return self

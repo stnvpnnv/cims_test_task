@@ -9,6 +9,9 @@ from math import isfinite
 from random import SystemRandom
 from typing import Final, Protocol
 
+from cims_task_service.application.retry_backoff import (
+    calculate_capped_exponential_retry_delay,
+)
 from cims_task_service.infrastructure.database.outbox_repository import (
     ClaimedOutboxEvent,
     OutboxRepository,
@@ -18,8 +21,6 @@ from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 
 _MINIMUM_JITTER_FACTOR: Final = 0.5
 _MAXIMUM_JITTER_FACTOR: Final = 1.0
-_MICROSECONDS_PER_SECOND: Final = 1_000_000
-_SECONDS_PER_DAY: Final = 86_400
 _SYSTEM_RANDOM: Final = SystemRandom()
 MAX_DISPATCH_BATCH_SIZE: Final = 100
 
@@ -61,32 +62,12 @@ def calculate_publish_retry_delay(
 
     if publish_attempts < 1:
         raise ValueError("publish_attempts must be at least 1")
-    if initial_delay <= timedelta(0):
-        raise ValueError("initial_delay must be positive")
-    if maximum_delay < initial_delay:
-        raise ValueError("maximum_delay must be at least initial_delay")
-    if not isfinite(jitter_factor) or not (
-        _MINIMUM_JITTER_FACTOR <= jitter_factor <= _MAXIMUM_JITTER_FACTOR
-    ):
-        raise ValueError("jitter_factor must be finite and between 0.5 and 1.0")
-
-    initial_microseconds = _timedelta_microseconds(initial_delay)
-    maximum_microseconds = _timedelta_microseconds(maximum_delay)
-    doublings = publish_attempts - 1
-    if doublings >= maximum_microseconds.bit_length():
-        capped_microseconds = maximum_microseconds
-    else:
-        capped_microseconds = min(
-            initial_microseconds << doublings,
-            maximum_microseconds,
-        )
-
-    jitter_numerator, jitter_denominator = jitter_factor.as_integer_ratio()
-    jittered_microseconds = min(
-        capped_microseconds,
-        max(1, capped_microseconds * jitter_numerator // jitter_denominator),
+    return calculate_capped_exponential_retry_delay(
+        publish_attempts,
+        initial_delay=initial_delay,
+        maximum_delay=maximum_delay,
+        jitter_factor=jitter_factor,
     )
-    return timedelta(microseconds=jittered_microseconds)
 
 
 def summarize_publication_failure(error: Exception) -> str:
@@ -249,12 +230,6 @@ async def run_dispatcher_loop(
 
 def _equal_jitter_factor() -> float:
     return _SYSTEM_RANDOM.uniform(_MINIMUM_JITTER_FACTOR, _MAXIMUM_JITTER_FACTOR)
-
-
-def _timedelta_microseconds(value: timedelta) -> int:
-    return (
-        value.days * _SECONDS_PER_DAY + value.seconds
-    ) * _MICROSECONDS_PER_SECOND + value.microseconds
 
 
 async def _wait_for_stop(

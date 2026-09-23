@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cims_task_service.application import task_execution_recovery as recovery_module
+from cims_task_service.application.execution_retry import ExecutionRetryDelayPolicy
 from cims_task_service.application.task_execution_recovery import (
     MAX_RECOVERY_BATCH_SIZE,
     ExecutionRecoveryInvariantError,
@@ -284,6 +285,73 @@ async def test_recovery_rolls_back_if_locked_ownership_is_unexpectedly_lost(
     exception = harness.transaction.__aexit__.await_args.args
     assert exception[0] is ExecutionRecoveryInvariantError
     assert exception[1] is error_info.value
+
+
+@pytest.mark.asyncio
+async def test_execution_retry_policy_composes_with_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each retryable execution gets fresh jitter; exhausted executions skip the policy."""
+
+    executions = (
+        _locked_execution(1, attempt_count=1),
+        _locked_execution(2, attempt_count=2),
+        _locked_execution(3, attempt_count=1),
+        _locked_execution(4, attempt_count=3),
+    )
+    harness = _recovery_harness(monkeypatch, executions)
+    jitter = Mock(side_effect=[0.5, 0.75, 1.0])
+    policy = ExecutionRetryDelayPolicy(
+        initial_delay=timedelta(seconds=4),
+        maximum_delay=timedelta(seconds=10),
+        jitter_factor_factory=jitter,
+    )
+    recovery = TaskExecutionRecovery(
+        cast(AsyncSessionFactory, SimpleNamespace(begin=harness.begin)),
+        batch_size=10,
+        retry_delay_for_attempt=policy,
+    )
+
+    assert await recovery.recover_once() == RecoveryBatchResult(locked=4, retried=3, failed=1)
+    assert jitter.call_count == 3
+    assert [args.kwargs["retry_delay"] for args in harness.schedule_retry.await_args_list] == [
+        timedelta(seconds=2),
+        timedelta(seconds=6),
+        timedelta(seconds=4),
+    ]
+    harness.transaction.__aexit__.assert_awaited_once_with(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_execution_jitter_failure_aborts_recovery_before_any_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sampling all delays before mutation keeps an entire batch atomic on policy failure."""
+
+    harness = _recovery_harness(
+        monkeypatch,
+        (_locked_execution(1), _locked_execution(2)),
+    )
+    expected_error = RuntimeError("jitter unavailable")
+    jitter = Mock(side_effect=[0.5, expected_error])
+    recovery = TaskExecutionRecovery(
+        cast(AsyncSessionFactory, SimpleNamespace(begin=harness.begin)),
+        batch_size=10,
+        retry_delay_for_attempt=ExecutionRetryDelayPolicy(
+            initial_delay=timedelta(seconds=4),
+            maximum_delay=timedelta(seconds=10),
+            jitter_factor_factory=jitter,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as error_info:
+        await recovery.recover_once()
+
+    assert error_info.value is expected_error
+    assert jitter.call_count == 2
+    harness.schedule_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+    assert harness.transaction.__aexit__.await_args.args[:2] == (RuntimeError, expected_error)
 
 
 @pytest.mark.parametrize(

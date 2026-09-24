@@ -19,9 +19,14 @@ from aio_pika.abc import (
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from cims_task_service import dispatcher as dispatcher_module
+from cims_task_service.application.execution_retry import ExecutionRetryDelayPolicy
 from cims_task_service.application.task_dispatcher import TaskOutboxDispatcher
+from cims_task_service.application.task_execution_recovery import TaskExecutionRecovery
 from cims_task_service.config import DispatcherSettings
-from cims_task_service.dispatcher import DispatcherShutdownTimeoutError
+from cims_task_service.dispatcher import (
+    DispatcherComponentExitedError,
+    DispatcherShutdownTimeoutError,
+)
 from cims_task_service.infrastructure.database.session import AsyncSessionFactory
 from cims_task_service.infrastructure.messaging.publisher import RabbitMQTaskPublisher
 
@@ -35,6 +40,8 @@ class _RuntimeHarness:
     exchange: AbstractRobustExchange
     publisher: RabbitMQTaskPublisher
     dispatcher: TaskOutboxDispatcher
+    retry_policy: ExecutionRetryDelayPolicy
+    recovery: TaskExecutionRecovery
     create_engine: Mock
     create_sessions: Mock
     connect: AsyncMock
@@ -44,7 +51,10 @@ class _RuntimeHarness:
     declare_topology: AsyncMock
     publisher_factory: Mock
     dispatcher_factory: Mock
+    retry_policy_factory: Mock
+    recovery_factory: Mock
     run_loop: AsyncMock
+    run_recovery_loop: AsyncMock
     dispose_engine: AsyncMock
     events: list[str]
 
@@ -79,6 +89,12 @@ def _install_runtime_harness(
         TaskOutboxDispatcher,
         SimpleNamespace(dispatch_once=dispatch_once),
     )
+    retry_policy = cast(ExecutionRetryDelayPolicy, object())
+    recover_once = AsyncMock()
+    recovery = cast(
+        TaskExecutionRecovery,
+        SimpleNamespace(recover_once=recover_once),
+    )
 
     create_engine = Mock(return_value=engine)
     create_sessions = Mock(return_value=session_factory)
@@ -90,7 +106,12 @@ def _install_runtime_harness(
     )
     publisher_factory = Mock(return_value=publisher)
     dispatcher_factory = Mock(return_value=dispatcher)
+    retry_policy_factory = Mock(return_value=retry_policy)
+    recovery_factory = Mock(return_value=recovery)
     run_loop = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("loop"))
+    run_recovery_loop = AsyncMock(
+        side_effect=lambda *_args, **_kwargs: events.append("recovery"),
+    )
     dispose_engine = AsyncMock(side_effect=lambda _engine: events.append("engine"))
 
     failure_targets: dict[str, Mock | AsyncMock] = {
@@ -101,7 +122,10 @@ def _install_runtime_harness(
         "topology": declare_topology,
         "publisher": publisher_factory,
         "dispatcher": dispatcher_factory,
+        "retry_policy": retry_policy_factory,
+        "recovery": recovery_factory,
         "loop": run_loop,
+        "recovery_loop": run_recovery_loop,
     }
     if failure_stage is not None:
         if expected_error is None:
@@ -120,7 +144,14 @@ def _install_runtime_harness(
     monkeypatch.setattr(dispatcher_module, "declare_task_topology", declare_topology)
     monkeypatch.setattr(dispatcher_module, "RabbitMQTaskPublisher", publisher_factory)
     monkeypatch.setattr(dispatcher_module, "TaskOutboxDispatcher", dispatcher_factory)
+    monkeypatch.setattr(dispatcher_module, "ExecutionRetryDelayPolicy", retry_policy_factory)
+    monkeypatch.setattr(dispatcher_module, "TaskExecutionRecovery", recovery_factory)
     monkeypatch.setattr(dispatcher_module, "run_dispatcher_loop", run_loop)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "run_execution_recovery_loop",
+        run_recovery_loop,
+    )
     monkeypatch.setattr(dispatcher_module, "dispose_database_engine", dispose_engine)
 
     return _RuntimeHarness(
@@ -131,6 +162,8 @@ def _install_runtime_harness(
         exchange=exchange,
         publisher=publisher,
         dispatcher=dispatcher,
+        retry_policy=retry_policy,
+        recovery=recovery,
         create_engine=create_engine,
         create_sessions=create_sessions,
         connect=connect,
@@ -140,7 +173,10 @@ def _install_runtime_harness(
         declare_topology=declare_topology,
         publisher_factory=publisher_factory,
         dispatcher_factory=dispatcher_factory,
+        retry_policy_factory=retry_policy_factory,
+        recovery_factory=recovery_factory,
         run_loop=run_loop,
+        run_recovery_loop=run_recovery_loop,
         dispose_engine=dispose_engine,
         events=events,
     )
@@ -148,7 +184,7 @@ def _install_runtime_harness(
 
 def _settings() -> DispatcherSettings:
     return DispatcherSettings(
-        database_pool_size=4,
+        database_pool_size=5,
         database_max_overflow=0,
         database_pool_timeout_seconds=5.0,
         dispatcher_batch_size=4,
@@ -156,18 +192,34 @@ def _settings() -> DispatcherSettings:
         dispatcher_lease_duration_seconds=30.0,
         dispatcher_retry_initial_delay_seconds=2.0,
         dispatcher_retry_maximum_delay_seconds=8.0,
+        execution_recovery_batch_size=7,
+        execution_recovery_poll_interval_seconds=0.5,
+        execution_retry_initial_delay_seconds=3.0,
+        execution_retry_maximum_delay_seconds=12.0,
         rabbitmq_publish_timeout_seconds=3.0,
     )
 
 
 async def _start_blocked_runtime(harness: _RuntimeHarness) -> asyncio.Task[None]:
-    loop_started = asyncio.Event()
+    dispatcher_started = asyncio.Event()
+    recovery_started = asyncio.Event()
 
-    async def wait_for_cancellation(*_args: object, **_kwargs: object) -> None:
-        loop_started.set()
+    async def wait_for_dispatcher_cancellation(
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        dispatcher_started.set()
         await asyncio.Event().wait()
 
-    harness.run_loop.side_effect = wait_for_cancellation
+    async def wait_for_recovery_cancellation(
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        recovery_started.set()
+        await asyncio.Event().wait()
+
+    harness.run_loop.side_effect = wait_for_dispatcher_cancellation
+    harness.run_recovery_loop.side_effect = wait_for_recovery_cancellation
     runtime_task = asyncio.create_task(
         dispatcher_module.run_dispatcher(
             _settings(),
@@ -176,7 +228,8 @@ async def _start_blocked_runtime(harness: _RuntimeHarness) -> asyncio.Task[None]
     )
     try:
         async with asyncio.timeout(1):
-            await loop_started.wait()
+            await dispatcher_started.wait()
+            await recovery_started.wait()
     except BaseException:
         runtime_task.cancel()
         with suppress(asyncio.CancelledError):
@@ -195,6 +248,7 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
     harness = _install_runtime_harness(monkeypatch)
     settings = _settings()
     stop_event = asyncio.Event()
+    stop_event.set()
 
     await dispatcher_module.run_dispatcher(settings, stop_event=stop_event)
 
@@ -215,15 +269,35 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
         retry_initial_delay=timedelta(seconds=2),
         retry_maximum_delay=timedelta(seconds=8),
     )
+    harness.retry_policy_factory.assert_called_once_with(
+        initial_delay=timedelta(seconds=3),
+        maximum_delay=timedelta(seconds=12),
+    )
+    harness.recovery_factory.assert_called_once_with(
+        harness.session_factory,
+        batch_size=7,
+        retry_delay_for_attempt=harness.retry_policy,
+    )
     harness.run_loop.assert_awaited_once_with(
         harness.dispatcher.dispatch_once,
         stop_event=stop_event,
         poll_interval_seconds=0.25,
     )
+    harness.run_recovery_loop.assert_awaited_once_with(
+        harness.recovery.recover_once,
+        stop_event=stop_event,
+        poll_interval_seconds=0.5,
+    )
     harness.close_channel.assert_awaited_once_with()
     harness.close_connection.assert_awaited_once_with(harness.connection)
     harness.dispose_engine.assert_awaited_once_with(harness.engine)
-    assert harness.events == ["loop", "channel", "connection", "engine"]
+    assert harness.events == [
+        "loop",
+        "recovery",
+        "channel",
+        "connection",
+        "engine",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -236,7 +310,10 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
         ("topology", ["channel", "connection", "engine"]),
         ("publisher", ["channel", "connection", "engine"]),
         ("dispatcher", ["channel", "connection", "engine"]),
-        ("loop", ["channel", "connection", "engine"]),
+        ("retry_policy", ["channel", "connection", "engine"]),
+        ("recovery", ["channel", "connection", "engine"]),
+        ("loop", ["recovery", "channel", "connection", "engine"]),
+        ("recovery_loop", ["loop", "channel", "connection", "engine"]),
     ],
 )
 @pytest.mark.asyncio
@@ -253,11 +330,13 @@ async def test_dispatcher_cleans_only_resources_acquired_before_failure(
         failure_stage=failure_stage,
         expected_error=expected_error,
     )
+    stop_event = asyncio.Event()
+    stop_event.set()
 
     with pytest.raises(RuntimeError) as error_info:
         await dispatcher_module.run_dispatcher(
             _settings(),
-            stop_event=asyncio.Event(),
+            stop_event=stop_event,
         )
 
     assert error_info.value is expected_error
@@ -278,15 +357,23 @@ async def test_dispatcher_runs_remaining_cleanup_after_channel_close_failure(
         raise expected_error
 
     harness.close_channel.side_effect = fail_channel_close
+    stop_event = asyncio.Event()
+    stop_event.set()
 
     with pytest.raises(RuntimeError) as error_info:
         await dispatcher_module.run_dispatcher(
             _settings(),
-            stop_event=asyncio.Event(),
+            stop_event=stop_event,
         )
 
     assert error_info.value is expected_error
-    assert harness.events == ["loop", "channel", "connection", "engine"]
+    assert harness.events == [
+        "loop",
+        "recovery",
+        "channel",
+        "connection",
+        "engine",
+    ]
 
 
 @pytest.mark.asyncio
@@ -345,6 +432,227 @@ async def test_dispatcher_surfaces_cleanup_failure_during_task_cancellation(
     assert runtime_task.done()
     assert not runtime_task.cancelled()
     assert harness.events == ["channel", "connection", "engine"]
+
+
+@pytest.mark.parametrize(
+    ("returning_component", "expected_component_name"),
+    [
+        ("dispatcher", "outbox dispatcher"),
+        ("recovery", "execution recovery"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_rejects_component_exit_before_shutdown(
+    returning_component: str,
+    expected_component_name: str,
+) -> None:
+    """Either long-running loop returning early is a process-level failure."""
+
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def return_after_sibling_starts() -> None:
+        await sibling_started.wait()
+
+    async def wait_for_cancellation() -> None:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    dispatcher_loop = (
+        return_after_sibling_starts
+        if returning_component == "dispatcher"
+        else wait_for_cancellation
+    )
+    recovery_loop = (
+        return_after_sibling_starts if returning_component == "recovery" else wait_for_cancellation
+    )
+
+    with pytest.raises(DispatcherComponentExitedError) as error_info:
+        await dispatcher_module._run_dispatcher_components(
+            dispatcher_loop_factory=dispatcher_loop,
+            recovery_loop_factory=recovery_loop,
+            stop_event=asyncio.Event(),
+        )
+
+    assert error_info.value.component_name == expected_component_name
+    assert str(error_info.value) == (
+        f"dispatcher component {expected_component_name!r} exited before shutdown was requested"
+    )
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.parametrize("failing_component", ["dispatcher", "recovery"])
+@pytest.mark.asyncio
+async def test_runtime_preserves_single_component_failure_and_reaps_sibling(
+    failing_component: str,
+) -> None:
+    """One loop failure keeps its identity and cannot orphan the other loop."""
+
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+    expected_error = RuntimeError(f"{failing_component} failed")
+
+    async def fail_after_sibling_starts() -> None:
+        await sibling_started.wait()
+        raise expected_error
+
+    async def wait_for_cancellation() -> None:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    dispatcher_loop = (
+        fail_after_sibling_starts if failing_component == "dispatcher" else wait_for_cancellation
+    )
+    recovery_loop = (
+        fail_after_sibling_starts if failing_component == "recovery" else wait_for_cancellation
+    )
+
+    with pytest.raises(RuntimeError) as error_info:
+        await dispatcher_module._run_dispatcher_components(
+            dispatcher_loop_factory=dispatcher_loop,
+            recovery_loop_factory=recovery_loop,
+            stop_event=asyncio.Event(),
+        )
+
+    assert error_info.value is expected_error
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    ("cancelled_component", "expected_component_name"),
+    [
+        ("dispatcher", "outbox dispatcher"),
+        ("recovery", "execution recovery"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runtime_rejects_unrequested_component_cancellation(
+    cancelled_component: str,
+    expected_component_name: str,
+) -> None:
+    """An inner cancellation cannot silently leave the sibling loop running."""
+
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def cancel_after_sibling_starts() -> None:
+        await sibling_started.wait()
+        raise asyncio.CancelledError
+
+    async def wait_for_cancellation() -> None:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_cancelled.set()
+
+    dispatcher_loop = (
+        cancel_after_sibling_starts
+        if cancelled_component == "dispatcher"
+        else wait_for_cancellation
+    )
+    recovery_loop = (
+        cancel_after_sibling_starts if cancelled_component == "recovery" else wait_for_cancellation
+    )
+
+    with pytest.raises(DispatcherComponentExitedError) as error_info:
+        await dispatcher_module._run_dispatcher_components(
+            dispatcher_loop_factory=dispatcher_loop,
+            recovery_loop_factory=recovery_loop,
+            stop_event=asyncio.Event(),
+        )
+
+    assert error_info.value.component_name == expected_component_name
+    assert isinstance(error_info.value.__cause__, asyncio.CancelledError)
+    assert sibling_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_runtime_groups_simultaneous_component_failures() -> None:
+    """Independent failures from the same event-loop turn remain observable."""
+
+    dispatcher_started = asyncio.Event()
+    recovery_started = asyncio.Event()
+    dispatcher_error = RuntimeError("dispatcher failed")
+    recovery_error = ValueError("recovery failed")
+
+    async def fail_dispatcher() -> None:
+        dispatcher_started.set()
+        await recovery_started.wait()
+        raise dispatcher_error
+
+    async def fail_recovery() -> None:
+        recovery_started.set()
+        await dispatcher_started.wait()
+        raise recovery_error
+
+    with pytest.raises(BaseExceptionGroup) as error_info:
+        await dispatcher_module._run_dispatcher_components(
+            dispatcher_loop_factory=fail_dispatcher,
+            recovery_loop_factory=fail_recovery,
+            stop_event=asyncio.Event(),
+        )
+
+    assert len(error_info.value.exceptions) == 2
+    assert any(error is dispatcher_error for error in error_info.value.exceptions)
+    assert any(error is recovery_error for error in error_info.value.exceptions)
+
+
+@pytest.mark.asyncio
+async def test_runtime_external_cancellation_reaps_both_components() -> None:
+    """Cancelling the owner cannot leave either background loop running."""
+
+    dispatcher_started = asyncio.Event()
+    recovery_started = asyncio.Event()
+    dispatcher_cancelled = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+
+    async def run_until_cancelled(
+        started: asyncio.Event,
+        cancelled: asyncio.Event,
+    ) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runtime_task = asyncio.create_task(
+        dispatcher_module._run_dispatcher_components(
+            dispatcher_loop_factory=lambda: run_until_cancelled(
+                dispatcher_started,
+                dispatcher_cancelled,
+            ),
+            recovery_loop_factory=lambda: run_until_cancelled(
+                recovery_started,
+                recovery_cancelled,
+            ),
+            stop_event=asyncio.Event(),
+        ),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await dispatcher_started.wait()
+            await recovery_started.wait()
+        runtime_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await runtime_task
+    finally:
+        if not runtime_task.done():
+            runtime_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await runtime_task
+
+    assert runtime_task.cancelled()
+    assert dispatcher_cancelled.is_set()
+    assert recovery_cancelled.is_set()
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,11 @@ NEW / PENDING / IN_PROGRESS → CANCELLED
 Dispatcher использует lease и publisher confirms. Worker подтверждает
 сообщение только после фиксации результата в БД.
 
+Процесс dispatcher управляет циклами публикации outbox и восстановления
+просроченных execution lease. Они используют общий сигнал остановки и пул БД;
+сбой одного цикла останавливает второй. Одно соединение резервируется recovery:
+`database_pool_size + database_max_overflow >= dispatcher_batch_size + 1`.
+
 Publisher отправляет persistent-сообщение как mandatory и считает публикацию
 успешной только после подтверждения RabbitMQ; `Basic.Return` является ошибкой.
 `message_id` равен UUID outbox-события, `correlation_id` — UUID задачи и не меняются

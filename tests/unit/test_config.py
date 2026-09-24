@@ -366,15 +366,16 @@ def test_settings_reject_invalid_operational_values(
 
 @pytest.mark.parametrize("batch_size", [1, MAX_DISPATCH_BATCH_SIZE])
 def test_dispatcher_batch_size_accepts_core_boundaries(batch_size: int) -> None:
-    """Configuration and dispatcher resource limits remain synchronized."""
+    """Core batch limits accept exactly one connection of recovery headroom."""
 
     settings = DispatcherSettings(
         dispatcher_batch_size=batch_size,
         database_pool_size=batch_size,
-        database_max_overflow=0,
+        database_max_overflow=1,
     )
 
     assert settings.dispatcher_batch_size == batch_size
+    assert settings.database_pool_size + settings.database_max_overflow == batch_size + 1
 
 
 @pytest.mark.parametrize(
@@ -526,17 +527,21 @@ def test_execution_retry_delay_accepts_one_day_limit() -> None:
     assert settings.execution_retry_maximum_delay_seconds == 86_400.0
 
 
-def test_dispatcher_batch_must_fit_the_database_pool() -> None:
-    """Every event in a finalization wave must be able to acquire a connection."""
+@pytest.mark.parametrize("batch_size", [1, MAX_DISPATCH_BATCH_SIZE])
+def test_database_pool_reserves_a_connection_for_recovery(batch_size: int) -> None:
+    """A pool sized only for dispatch finalization cannot run recovery concurrently."""
 
     with pytest.raises(
         ValidationError,
-        match="dispatcher batch size must not exceed database pool capacity",
+        match=(
+            "database pool capacity must cover the dispatcher batch plus one "
+            "execution recovery connection"
+        ),
     ):
         DispatcherSettings(
-            dispatcher_batch_size=3,
-            database_pool_size=1,
-            database_max_overflow=1,
+            dispatcher_batch_size=batch_size,
+            database_pool_size=batch_size,
+            database_max_overflow=0,
         )
 
 

@@ -134,8 +134,12 @@ class DispatcherSettings(Settings):
             raise ValueError(message)
 
         database_pool_capacity = self.database_pool_size + self.database_max_overflow
-        if self.dispatcher_batch_size > database_pool_capacity:
-            message = "dispatcher batch size must not exceed database pool capacity"
+        required_database_pool_capacity = self.dispatcher_batch_size + 1
+        if required_database_pool_capacity > database_pool_capacity:
+            message = (
+                "database pool capacity must cover the dispatcher batch plus one "
+                "execution recovery connection"
+            )
             raise ValueError(message)
 
         if lease_duration <= required_lease_duration:

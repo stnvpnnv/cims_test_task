@@ -7,7 +7,12 @@ from cims_task_service.application.task_dispatcher import MAX_DISPATCH_BATCH_SIZ
 from cims_task_service.application.task_execution_recovery import (
     MAX_RECOVERY_BATCH_SIZE,
 )
-from cims_task_service.config import DispatcherSettings, Settings
+from cims_task_service.config import (
+    MAX_WORKER_CONCURRENCY,
+    DispatcherSettings,
+    Settings,
+    WorkerSettings,
+)
 
 _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_DISPATCHER_POLL_INTERVAL_SECONDS",
@@ -19,6 +24,13 @@ _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
     "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
     "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
+)
+
+_WORKER_DURATION_ENVIRONMENT_VARIABLES = (
+    "CIMS_WORKER_LEASE_DURATION_SECONDS",
+    "CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS",
+    "CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS",
+    "CIMS_WORKER_SHUTDOWN_GRACE_SECONDS",
 )
 
 _SETTINGS_ENVIRONMENT_VARIABLES = (
@@ -34,7 +46,9 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS",
     "CIMS_DISPATCHER_BATCH_SIZE",
     "CIMS_EXECUTION_RECOVERY_BATCH_SIZE",
+    "CIMS_WORKER_CONCURRENCY",
     *_DISPATCHER_DURATION_ENVIRONMENT_VARIABLES,
+    *_WORKER_DURATION_ENVIRONMENT_VARIABLES,
 )
 
 
@@ -152,6 +166,38 @@ def test_dispatcher_settings_load_environment_overrides(
     assert settings.execution_retry_maximum_delay_seconds == 240.0
 
 
+def test_worker_settings_have_coherent_defaults() -> None:
+    """Defaults provide heartbeat and shutdown headroom for local execution."""
+
+    settings = WorkerSettings()
+
+    assert settings.worker_concurrency == 4
+    assert settings.worker_lease_duration_seconds == 60.0
+    assert settings.worker_heartbeat_interval_seconds == 15.0
+    assert settings.worker_processing_timeout_seconds == 300.0
+    assert settings.worker_shutdown_grace_seconds == 45.0
+
+
+def test_worker_settings_load_environment_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dedicated process receives typed project-prefixed deployment values."""
+
+    monkeypatch.setenv("CIMS_WORKER_CONCURRENCY", "6")
+    monkeypatch.setenv("CIMS_WORKER_LEASE_DURATION_SECONDS", "55")
+    monkeypatch.setenv("CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "12.5")
+    monkeypatch.setenv("CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS", "240")
+    monkeypatch.setenv("CIMS_WORKER_SHUTDOWN_GRACE_SECONDS", "20.5")
+
+    settings = WorkerSettings()
+
+    assert settings.worker_concurrency == 6
+    assert settings.worker_lease_duration_seconds == 55.0
+    assert settings.worker_heartbeat_interval_seconds == 12.5
+    assert settings.worker_processing_timeout_seconds == 240.0
+    assert settings.worker_shutdown_grace_seconds == 20.5
+
+
 @pytest.mark.parametrize(
     ("variable_name", "attribute_name"),
     [
@@ -198,16 +244,56 @@ def test_dispatcher_settings_load_environment_overrides(
         ),
     ],
 )
-def test_base_settings_ignore_dispatcher_only_environment(
+@pytest.mark.parametrize("settings_type", [Settings, WorkerSettings])
+def test_non_dispatcher_settings_ignore_dispatcher_only_environment(
     monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Settings],
     variable_name: str,
     attribute_name: str,
 ) -> None:
-    """An API process is not rejected by settings it never consumes."""
+    """API and worker processes ignore settings owned only by the dispatcher."""
 
     monkeypatch.setenv(variable_name, "not-a-valid-value")
 
-    settings = Settings()
+    settings = settings_type()
+
+    assert not hasattr(settings, attribute_name)
+
+
+@pytest.mark.parametrize(
+    ("variable_name", "attribute_name"),
+    [
+        ("CIMS_WORKER_CONCURRENCY", "worker_concurrency"),
+        (
+            "CIMS_WORKER_LEASE_DURATION_SECONDS",
+            "worker_lease_duration_seconds",
+        ),
+        (
+            "CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS",
+            "worker_heartbeat_interval_seconds",
+        ),
+        (
+            "CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS",
+            "worker_processing_timeout_seconds",
+        ),
+        (
+            "CIMS_WORKER_SHUTDOWN_GRACE_SECONDS",
+            "worker_shutdown_grace_seconds",
+        ),
+    ],
+)
+@pytest.mark.parametrize("settings_type", [Settings, DispatcherSettings])
+def test_non_worker_settings_ignore_worker_only_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Settings],
+    variable_name: str,
+    attribute_name: str,
+) -> None:
+    """Unrelated processes ignore invalid settings owned by the worker."""
+
+    monkeypatch.setenv(variable_name, "not-a-valid-value")
+
+    settings = settings_type()
 
     assert not hasattr(settings, attribute_name)
 
@@ -630,3 +716,164 @@ def test_dispatcher_rejects_durations_outside_timedelta_range(
         match="dispatcher durations must fit within Python timedelta range",
     ):
         DispatcherSettings.model_validate(overrides)
+
+
+@pytest.mark.parametrize("concurrency", [1, MAX_WORKER_CONCURRENCY])
+def test_worker_concurrency_accepts_boundaries(concurrency: int) -> None:
+    """Worker concurrency accepts its documented operational range."""
+
+    settings = WorkerSettings(
+        worker_concurrency=concurrency,
+        database_pool_size=concurrency,
+        database_max_overflow=0,
+    )
+
+    assert settings.worker_concurrency == concurrency
+    assert settings.database_pool_size + settings.database_max_overflow == concurrency
+
+
+@pytest.mark.parametrize(
+    "invalid_concurrency",
+    ["0", "-1", "1.5", str(MAX_WORKER_CONCURRENCY + 1)],
+)
+def test_worker_concurrency_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_concurrency: str,
+) -> None:
+    """Invalid or resource-amplifying concurrency fails during startup."""
+
+    monkeypatch.setenv("CIMS_WORKER_CONCURRENCY", invalid_concurrency)
+    monkeypatch.setenv("CIMS_DATABASE_POOL_SIZE", str(MAX_WORKER_CONCURRENCY))
+    monkeypatch.setenv("CIMS_DATABASE_MAX_OVERFLOW", "0")
+
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+
+
+def test_database_pool_must_cover_worker_concurrency() -> None:
+    """Every worker slot can acquire a connection without guaranteed starvation."""
+
+    with pytest.raises(
+        ValidationError,
+        match="database pool capacity must cover worker concurrency",
+    ):
+        WorkerSettings(
+            worker_concurrency=5,
+            database_pool_size=4,
+            database_max_overflow=0,
+        )
+
+
+@pytest.mark.parametrize("variable_name", _WORKER_DURATION_ENVIRONMENT_VARIABLES)
+@pytest.mark.parametrize("invalid_value", ["0", "-0.1"])
+def test_worker_durations_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """Zero and negative durations cannot reach runtime timeout primitives."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+
+
+@pytest.mark.parametrize("variable_name", _WORKER_DURATION_ENVIRONMENT_VARIABLES)
+@pytest.mark.parametrize("invalid_value", ["nan", "inf", "-inf"])
+def test_worker_durations_must_be_finite(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """IEEE special values are rejected before timeout calculations."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        WorkerSettings()
+
+
+@pytest.mark.parametrize("heartbeat_interval", [60.0, 60.1])
+def test_worker_heartbeat_must_be_shorter_than_lease(
+    heartbeat_interval: float,
+) -> None:
+    """A heartbeat cannot renew a lease after that lease may already expire."""
+
+    with pytest.raises(
+        ValidationError,
+        match="worker heartbeat interval must be shorter than its lease duration",
+    ):
+        WorkerSettings(
+            worker_lease_duration_seconds=60.0,
+            worker_heartbeat_interval_seconds=heartbeat_interval,
+        )
+
+
+@pytest.mark.parametrize("lease_duration", [45.0, 44.9, 45.0000004])
+def test_worker_lease_must_exceed_heartbeat_and_pool_timeout(
+    lease_duration: float,
+) -> None:
+    """One delayed renewal retains enough time to acquire a database connection."""
+
+    with pytest.raises(
+        ValidationError,
+        match=(
+            "worker lease duration must exceed the heartbeat interval and database pool timeout"
+        ),
+    ):
+        WorkerSettings(
+            worker_lease_duration_seconds=lease_duration,
+            worker_heartbeat_interval_seconds=15.0,
+            database_pool_timeout_seconds=30.0,
+        )
+
+
+def test_worker_lease_accepts_duration_above_renewal_budget() -> None:
+    """A lease strictly above the renewal budget satisfies its safety margin."""
+
+    settings = WorkerSettings(
+        worker_lease_duration_seconds=45.000001,
+        worker_heartbeat_interval_seconds=15.0,
+        database_pool_timeout_seconds=30.0,
+    )
+
+    assert settings.worker_lease_duration_seconds == 45.000001
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "worker_lease_duration_seconds",
+        "worker_heartbeat_interval_seconds",
+        "worker_processing_timeout_seconds",
+        "worker_shutdown_grace_seconds",
+    ],
+)
+def test_worker_rejects_durations_that_round_to_zero(field_name: str) -> None:
+    """Validated durations remain positive after conversion to timedelta."""
+
+    with pytest.raises(
+        ValidationError,
+        match="worker durations must resolve to at least one microsecond",
+    ):
+        WorkerSettings.model_validate({field_name: 1e-10})
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "worker_lease_duration_seconds",
+        "worker_heartbeat_interval_seconds",
+        "worker_processing_timeout_seconds",
+        "worker_shutdown_grace_seconds",
+    ],
+)
+def test_worker_rejects_durations_outside_timedelta_range(field_name: str) -> None:
+    """Finite deployment values must still be representable by runtime types."""
+
+    with pytest.raises(
+        ValidationError,
+        match="worker durations must fit within Python timedelta range",
+    ):
+        WorkerSettings.model_validate({field_name: 1e308})

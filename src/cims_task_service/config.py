@@ -27,6 +27,7 @@ type _AmqpUrl = Annotated[
 
 _AMQP_URL_ADAPTER: TypeAdapter[_AmqpUrl] = TypeAdapter(_AmqpUrl)
 MAX_EXECUTION_RETRY_DELAY_SECONDS: Final = 86_400.0
+MAX_WORKER_CONCURRENCY: Final = 100
 
 
 class Settings(BaseSettings):
@@ -161,6 +162,61 @@ class DispatcherSettings(Settings):
 
         if retry_maximum_delay < retry_initial_delay:
             message = "execution retry maximum delay must be at least its initial delay"
+            raise ValueError(message)
+
+        return self
+
+
+class WorkerSettings(Settings):
+    """Settings used only by the independently deployed worker process."""
+
+    worker_concurrency: Annotated[int, Field(ge=1, le=MAX_WORKER_CONCURRENCY)] = 4
+    worker_lease_duration_seconds: PositiveFloat = 60.0
+    worker_heartbeat_interval_seconds: PositiveFloat = 15.0
+    worker_processing_timeout_seconds: PositiveFloat = 300.0
+    worker_shutdown_grace_seconds: PositiveFloat = 45.0
+
+    @model_validator(mode="after")
+    def require_coherent_worker_policy(self) -> Self:
+        """Reject unsafe worker resource and timer relationships."""
+
+        database_pool_capacity = self.database_pool_size + self.database_max_overflow
+        if self.worker_concurrency > database_pool_capacity:
+            message = "database pool capacity must cover worker concurrency"
+            raise ValueError(message)
+
+        try:
+            lease_duration = timedelta(seconds=self.worker_lease_duration_seconds)
+            heartbeat_interval = timedelta(seconds=self.worker_heartbeat_interval_seconds)
+            processing_timeout = timedelta(seconds=self.worker_processing_timeout_seconds)
+            shutdown_grace = timedelta(seconds=self.worker_shutdown_grace_seconds)
+            required_lease_duration = heartbeat_interval + timedelta(
+                seconds=self.database_pool_timeout_seconds,
+            )
+        except OverflowError as error:
+            message = "worker durations must fit within Python timedelta range"
+            raise ValueError(message) from error
+
+        if any(
+            duration <= timedelta(0)
+            for duration in (
+                lease_duration,
+                heartbeat_interval,
+                processing_timeout,
+                shutdown_grace,
+            )
+        ):
+            message = "worker durations must resolve to at least one microsecond"
+            raise ValueError(message)
+
+        if heartbeat_interval >= lease_duration:
+            message = "worker heartbeat interval must be shorter than its lease duration"
+            raise ValueError(message)
+
+        if lease_duration <= required_lease_duration:
+            message = (
+                "worker lease duration must exceed the heartbeat interval and database pool timeout"
+            )
             raise ValueError(message)
 
         return self

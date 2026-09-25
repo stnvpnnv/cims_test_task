@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cims_task_service.application import task_execution as task_execution_module
 from cims_task_service.application.task_execution import (
     INVALID_PROCESSOR_RESULT_CODE,
+    PROCESSING_TIMEOUT_ERROR_CODE,
     TaskExecutionOutcome,
     TaskExecutor,
 )
@@ -36,6 +37,7 @@ _DISPATCH_TOKEN = UUID("93806a60-eb97-4b07-8244-f3a506479ef8")
 _EXECUTION_TOKEN = UUID("a73632c4-4e1d-419f-83f2-e8894ef69a58")
 _LEASE_DURATION = timedelta(seconds=60)
 _HEARTBEAT_INTERVAL = timedelta(seconds=15)
+_PROCESSING_TIMEOUT = timedelta(seconds=300)
 _LEASE_EXPIRES_AT = datetime(2026, 9, 25, 2, 30, tzinfo=UTC)
 
 type FinalizationPath = Literal["completion", "retry", "failure"]
@@ -120,6 +122,7 @@ def _execution_harness(
     retry_result: bool = True,
     failure_result: bool = True,
     heartbeat_interval: timedelta = _HEARTBEAT_INTERVAL,
+    processing_timeout: timedelta = _PROCESSING_TIMEOUT,
     heartbeat_transaction_count: int = 0,
     renew_execution_lease: AsyncMock | None = None,
     claim_on_exit: Callable[[], None] | None = None,
@@ -186,6 +189,7 @@ def _execution_harness(
         processor,
         lease_duration=_LEASE_DURATION,
         heartbeat_interval=heartbeat_interval,
+        processing_timeout=processing_timeout,
         retry_delay_for_attempt=retry_policy,
     )
     return _ExecutionHarness(
@@ -230,6 +234,26 @@ def _allow_heartbeat_renewals(
     )
 
 
+async def _wait_for_processor_and_deadline_snapshot(
+    tasks: tuple[asyncio.Task[object], ...],
+    *,
+    return_when: str,
+) -> tuple[set[asyncio.Task[object]], set[asyncio.Task[object]]]:
+    """Deterministically expose a simultaneous processor/deadline completion."""
+
+    assert return_when == asyncio.FIRST_COMPLETED
+    supervised = set(tasks)
+    processor_task = next(
+        task for task in supervised if task.get_name().startswith("task-processor-")
+    )
+    heartbeat_task = next(
+        task for task in supervised if task.get_name().startswith("task-heartbeat-")
+    )
+    deadline_task = next(iter(supervised - {processor_task, heartbeat_task}))
+    await asyncio.gather(processor_task, deadline_task, return_exceptions=True)
+    return {processor_task, deadline_task}, {heartbeat_task}
+
+
 @pytest.mark.parametrize("lease_duration", [timedelta(0), timedelta(microseconds=-1)])
 def test_executor_rejects_a_non_positive_lease_before_database_access(
     lease_duration: timedelta,
@@ -245,6 +269,7 @@ def test_executor_rejects_a_non_positive_lease_before_database_access(
             cast(TaskProcessor, SimpleNamespace(process=process)),
             lease_duration=lease_duration,
             heartbeat_interval=_HEARTBEAT_INTERVAL,
+            processing_timeout=_PROCESSING_TIMEOUT,
             retry_delay_for_attempt=Mock(),
         )
 
@@ -282,6 +307,30 @@ def test_executor_rejects_an_invalid_heartbeat_before_database_access(
             cast(TaskProcessor, SimpleNamespace(process=process)),
             lease_duration=_LEASE_DURATION,
             heartbeat_interval=heartbeat_interval,
+            processing_timeout=_PROCESSING_TIMEOUT,
+            retry_delay_for_attempt=Mock(),
+        )
+
+    begin.assert_not_called()
+    process.assert_not_awaited()
+
+
+@pytest.mark.parametrize("processing_timeout", [timedelta(0), timedelta(microseconds=-1)])
+def test_executor_rejects_a_non_positive_processing_timeout_before_database_access(
+    processing_timeout: timedelta,
+) -> None:
+    """Invalid processing deadlines cannot start database or processor work."""
+
+    begin = Mock()
+    process = AsyncMock()
+
+    with pytest.raises(ValueError, match=r"^processing_timeout must be positive$"):
+        TaskExecutor(
+            cast(AsyncSessionFactory, SimpleNamespace(begin=begin)),
+            cast(TaskProcessor, SimpleNamespace(process=process)),
+            lease_duration=_LEASE_DURATION,
+            heartbeat_interval=_HEARTBEAT_INTERVAL,
+            processing_timeout=processing_timeout,
             retry_delay_for_attempt=Mock(),
         )
 
@@ -479,6 +528,595 @@ async def test_finalization_waits_for_an_in_flight_heartbeat_commit(
 
 
 @pytest.mark.asyncio
+async def test_processing_timeout_keeps_heartbeat_active_during_processor_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timed-out work is reaped before heartbeat shutdown and retry finalization."""
+
+    processor_started = asyncio.Event()
+    processor_cleanup_started = asyncio.Event()
+    allow_processor_cleanup = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    heartbeat_renewed_during_cleanup = asyncio.Event()
+    heartbeat_stop_requested = asyncio.Event()
+    never_finish = asyncio.Event()
+    heartbeat_wait_count = 0
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            processor_cleanup_started.set()
+            await allow_processor_cleanup.wait()
+            raise
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    async def wait_for_heartbeat_stop(
+        stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        nonlocal heartbeat_wait_count
+        assert interval_seconds == _HEARTBEAT_INTERVAL.total_seconds()
+        heartbeat_wait_count += 1
+        if heartbeat_wait_count > 1:
+            await stop_event.wait()
+            return True
+
+        set_stop_event = stop_event.set
+
+        def record_heartbeat_stop() -> None:
+            set_stop_event()
+            heartbeat_stop_requested.set()
+
+        monkeypatch.setattr(stop_event, "set", record_heartbeat_stop)
+        await processor_cleanup_started.wait()
+        return False
+
+    async def renew_lease(*_args: object, **_kwargs: object) -> bool:
+        assert processor_cleanup_started.is_set()
+        assert not processor_reaped.is_set()
+        heartbeat_renewed_during_cleanup.set()
+        allow_processor_cleanup.set()
+        return True
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        wait_for_heartbeat_stop,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=renew_lease),
+    )
+
+    def schedule_after_supervised_shutdown(*_args: object, **_kwargs: object) -> bool:
+        assert heartbeat_renewed_during_cleanup.is_set()
+        assert processor_reaped.is_set()
+        assert heartbeat_stop_requested.is_set()
+        return True
+
+    harness.schedule_execution_retry.side_effect = schedule_after_supervised_shutdown
+
+    outcome = await asyncio.wait_for(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+        timeout=1,
+    )
+
+    assert outcome is TaskExecutionOutcome.RETRY_SCHEDULED
+    harness.retry_delay_for_attempt.assert_called_once_with(1)
+    harness.schedule_execution_retry.assert_awaited_once_with(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        retry_delay=timedelta(seconds=10),
+        event_type=TASK_ROUTING_KEY,
+        message_priority=3,
+    )
+    harness.complete_execution.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lost_renewal_during_timeout_cleanup_prevents_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ownership loss during cancellation outranks the pending timeout outcome."""
+
+    processor_started = asyncio.Event()
+    processor_cleanup_started = asyncio.Event()
+    allow_processor_cleanup = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+    heartbeat_wait_count = 0
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            processor_cleanup_started.set()
+            await allow_processor_cleanup.wait()
+            raise
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    async def wait_for_heartbeat_stop(
+        stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        nonlocal heartbeat_wait_count
+        assert interval_seconds == _HEARTBEAT_INTERVAL.total_seconds()
+        heartbeat_wait_count += 1
+        if heartbeat_wait_count == 1:
+            await processor_cleanup_started.wait()
+            return False
+        await stop_event.wait()
+        return True
+
+    async def lose_ownership(*_args: object, **_kwargs: object) -> bool:
+        assert processor_cleanup_started.is_set()
+        allow_processor_cleanup.set()
+        return False
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        wait_for_heartbeat_stop,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=lose_ownership),
+    )
+
+    outcome = await asyncio.wait_for(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+        timeout=1,
+    )
+
+    assert outcome is TaskExecutionOutcome.LOST_OWNERSHIP
+    assert processor_reaped.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_processor_cleanup_failure_outranks_processing_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A processor cancellation defect remains visible instead of becoming a retry."""
+
+    cleanup_error = RuntimeError("processor timeout cleanup failed")
+    processor_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            raise cleanup_error
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^processor timeout cleanup failed$",
+    ) as error_info:
+        await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert error_info.value is cleanup_error
+    harness.retry_delay_for_attempt.assert_not_called()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_failure_during_timeout_cleanup_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renewal error during cancellation remains an infrastructure failure."""
+
+    expected_error = OSError("timeout cleanup heartbeat query failed")
+    processor_started = asyncio.Event()
+    processor_cleanup_started = asyncio.Event()
+    allow_processor_cleanup = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+    heartbeat_wait_count = 0
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            processor_cleanup_started.set()
+            await allow_processor_cleanup.wait()
+            raise
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    async def wait_for_heartbeat_stop(
+        stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        nonlocal heartbeat_wait_count
+        assert interval_seconds == _HEARTBEAT_INTERVAL.total_seconds()
+        heartbeat_wait_count += 1
+        if heartbeat_wait_count == 1:
+            await processor_cleanup_started.wait()
+            return False
+        await stop_event.wait()
+        return True
+
+    async def fail_renewal(*_args: object, **_kwargs: object) -> bool:
+        assert processor_cleanup_started.is_set()
+        allow_processor_cleanup.set()
+        raise expected_error
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        wait_for_heartbeat_stop,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=fail_renewal),
+    )
+
+    with pytest.raises(
+        OSError,
+        match=r"^timeout cleanup heartbeat query failed$",
+    ) as error_info:
+        await asyncio.wait_for(
+            harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+            timeout=1,
+        )
+
+    assert error_info.value is expected_error
+    assert processor_reaped.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_normal_heartbeat_stop_during_timeout_cleanup_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An impossible heartbeat stop during cancellation is not a timeout outcome."""
+
+    processor_started = asyncio.Event()
+    processor_cleanup_started = asyncio.Event()
+    allow_processor_cleanup = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        except asyncio.CancelledError:
+            processor_cleanup_started.set()
+            await allow_processor_cleanup.wait()
+            await asyncio.sleep(0)
+            raise
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    async def stop_heartbeat_during_cleanup(
+        _stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        assert interval_seconds == _HEARTBEAT_INTERVAL.total_seconds()
+        await processor_cleanup_started.wait()
+        allow_processor_cleanup.set()
+        return True
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        stop_heartbeat_during_cleanup,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^execution heartbeat stopped before processing finished$",
+    ):
+        await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert processor_reaped.is_set()
+    harness.renew_execution_lease.assert_not_awaited()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_processing_timeout_is_persisted_as_retryable_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempt exhaustion retains the timeout classification without another retry."""
+
+    processor_started = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(attempt_count=3, max_attempts=3),
+        process=AsyncMock(side_effect=process_task),
+    )
+
+    outcome = await asyncio.wait_for(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+        timeout=1,
+    )
+
+    assert outcome is TaskExecutionOutcome.FAILED
+    assert processor_reaped.is_set()
+    harness.fail_execution.assert_awaited_once_with(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        error={"code": PROCESSING_TIMEOUT_ERROR_CODE, "retryable": True},
+    )
+    harness.retry_delay_for_attempt.assert_not_called()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_processor_timeout_error_propagates_without_becoming_our_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A processor's own TimeoutError remains an unexpected infrastructure error."""
+
+    expected_error = TimeoutError("processor dependency timed out")
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=expected_error),
+    )
+
+    with pytest.raises(TimeoutError, match=r"^processor dependency timed out$") as error_info:
+        await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert error_info.value is expected_error
+    harness.retry_delay_for_attempt.assert_not_called()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_processor_and_deadline_completion_prefers_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A result already ready in the same wait snapshot is not misclassified as timeout."""
+
+    async def finish_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        finish_deadline,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "wait",
+        _wait_for_processor_and_deadline_snapshot,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(return_value={"processed": True}),
+    )
+
+    outcome = await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert outcome is TaskExecutionOutcome.COMPLETED
+    harness.complete_execution.assert_awaited_once_with(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        result={"processed": True},
+    )
+    harness.retry_delay_for_attempt.assert_not_called()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_processor_failure_and_deadline_propagates_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected processor defects outrank a simultaneous business timeout."""
+
+    expected_error = RuntimeError("processor defect")
+
+    async def finish_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        finish_deadline,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "wait",
+        _wait_for_processor_and_deadline_snapshot,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=expected_error),
+    )
+
+    with pytest.raises(RuntimeError, match=r"^processor defect$") as error_info:
+        await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert error_info.value is expected_error
+    harness.retry_delay_for_attempt.assert_not_called()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_heartbeat_loss_and_deadline_prefers_ownership_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale worker cannot schedule a timeout retry from the same wait snapshot."""
+
+    processor_started = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def finish_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        await processor_started.wait()
+
+    async def wait_for_heartbeat_and_deadline(
+        tasks: tuple[asyncio.Task[object], ...],
+        *,
+        return_when: str,
+    ) -> tuple[set[asyncio.Task[object]], set[asyncio.Task[object]]]:
+        assert return_when == asyncio.FIRST_COMPLETED
+        supervised = set(tasks)
+        processor_task = next(
+            task for task in supervised if task.get_name().startswith("task-processor-")
+        )
+        heartbeat_task = next(
+            task for task in supervised if task.get_name().startswith("task-heartbeat-")
+        )
+        deadline_task = next(iter(supervised - {processor_task, heartbeat_task}))
+        await asyncio.gather(heartbeat_task, deadline_task)
+        return {heartbeat_task, deadline_task}, {processor_task}
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        finish_deadline,
+    )
+    monkeypatch.setattr(asyncio, "wait", wait_for_heartbeat_and_deadline)
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(return_value=False),
+    )
+
+    outcome = await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert outcome is TaskExecutionOutcome.LOST_OWNERSHIP
+    assert processor_reaped.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_lost_heartbeat_ownership_cancels_and_reaps_the_processor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -557,10 +1195,12 @@ async def test_lost_ownership_preserves_a_processor_error_after_wait_snapshot(
             return_when=return_when,
         )
         assert len(completed) == 1
-        assert len(pending) == 1
-        pending_task = next(iter(pending))
-        pending_task.cancel()
-        await asyncio.gather(pending_task, return_exceptions=True)
+        assert len(pending) == 2
+        processor_task = next(
+            task for task in pending if task.get_name().startswith("task-processor-")
+        )
+        processor_task.cancel()
+        await asyncio.gather(processor_task, return_exceptions=True)
         return completed, pending
 
     monkeypatch.setattr(asyncio, "wait", wait_after_pending_finishes)
@@ -724,6 +1364,8 @@ async def test_external_cancellation_reaps_processor_and_heartbeat(
     processor_reaped = asyncio.Event()
     heartbeat_started = asyncio.Event()
     heartbeat_reaped = asyncio.Event()
+    deadline_started = asyncio.Event()
+    deadline_reaped = asyncio.Event()
     never_finish = asyncio.Event()
 
     async def process_task(_task: TaskProcessingInput) -> JsonObject:
@@ -742,6 +1384,20 @@ async def test_external_cancellation_reaps_processor_and_heartbeat(
             heartbeat_reaped.set()
         raise AssertionError("unreachable")
 
+    async def wait_for_deadline(*, timeout_seconds: float) -> None:
+        assert timeout_seconds == _PROCESSING_TIMEOUT.total_seconds()
+        deadline_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            deadline_reaped.set()
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_processing_deadline",
+        wait_for_deadline,
+    )
+
     harness = _execution_harness(
         monkeypatch,
         _claimed_execution(),
@@ -755,6 +1411,7 @@ async def test_external_cancellation_reaps_processor_and_heartbeat(
 
     await asyncio.wait_for(processor_started.wait(), timeout=1)
     await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+    await asyncio.wait_for(deadline_started.wait(), timeout=1)
     execution.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -762,6 +1419,7 @@ async def test_external_cancellation_reaps_processor_and_heartbeat(
 
     assert processor_reaped.is_set()
     assert heartbeat_reaped.is_set()
+    assert deadline_reaped.is_set()
     harness.complete_execution.assert_not_awaited()
     harness.schedule_execution_retry.assert_not_awaited()
     harness.fail_execution.assert_not_awaited()
@@ -972,6 +1630,16 @@ async def test_heartbeat_wait_preserves_an_unrelated_timeout_error() -> None:
 
     assert error_info.value is expected_error
     wait.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_processing_deadline_wait_completes_after_its_timer() -> None:
+    """The dedicated deadline helper completes normally instead of raising TimeoutError."""
+
+    await asyncio.wait_for(
+        task_execution_module._wait_for_processing_deadline(timeout_seconds=0),
+        timeout=1,
+    )
 
 
 @pytest.mark.asyncio

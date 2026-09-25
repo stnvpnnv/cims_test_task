@@ -28,6 +28,7 @@ from cims_task_service.infrastructure.messaging.topology import (
 )
 
 INVALID_PROCESSOR_RESULT_CODE: Final = "INVALID_PROCESSOR_RESULT"
+PROCESSING_TIMEOUT_ERROR_CODE: Final = "PROCESSING_TIMEOUT"
 _PROCESSOR_RESULT_ADAPTER: Final[TypeAdapter[JsonObject]] = TypeAdapter(
     JsonObject,
     config=ConfigDict(strict=True, allow_inf_nan=False),
@@ -81,6 +82,7 @@ class TaskExecutor:
         *,
         lease_duration: timedelta,
         heartbeat_interval: timedelta,
+        processing_timeout: timedelta,
         retry_delay_for_attempt: RetryDelayForAttempt,
     ) -> None:
         if lease_duration <= timedelta(0):
@@ -89,11 +91,14 @@ class TaskExecutor:
             raise ValueError("heartbeat_interval must be positive")
         if heartbeat_interval >= lease_duration:
             raise ValueError("heartbeat_interval must be shorter than lease_duration")
+        if processing_timeout <= timedelta(0):
+            raise ValueError("processing_timeout must be positive")
 
         self._session_factory = session_factory
         self._processor = processor
         self._lease_duration = lease_duration
         self._heartbeat_interval = heartbeat_interval
+        self._processing_timeout = processing_timeout
         self._retry_delay_for_attempt = retry_delay_for_attempt
 
     async def execute(
@@ -116,7 +121,7 @@ class TaskExecutor:
             attempt_count=claimed.attempt_count,
             max_attempts=claimed.max_attempts,
         )
-        processing_outcome = await self._process_with_heartbeat(claimed, processing_input)
+        processing_outcome = await self._process_with_supervision(claimed, processing_input)
         if processing_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
             return TaskExecutionOutcome.LOST_OWNERSHIP
         if isinstance(processing_outcome, _ProcessorFailed):
@@ -150,7 +155,7 @@ class TaskExecutor:
 
         return claimed
 
-    async def _process_with_heartbeat(
+    async def _process_with_supervision(
         self,
         claimed: ClaimedTaskExecution,
         processing_input: TaskProcessingInput,
@@ -164,9 +169,16 @@ class TaskExecutor:
             self._run_heartbeat(claimed, stop_event=stop_event),
             name=f"task-heartbeat-{claimed.task_id}",
         )
+        deadline_task = asyncio.create_task(
+            _wait_for_processing_deadline(
+                timeout_seconds=self._processing_timeout.total_seconds(),
+            ),
+            name=f"task-processing-deadline-{claimed.task_id}",
+        )
         supervised_tasks: tuple[asyncio.Task[object], ...] = (
             processor_task,
             heartbeat_task,
+            deadline_task,
         )
 
         try:
@@ -177,23 +189,43 @@ class TaskExecutor:
             failures = _completed_task_failures(
                 task for task in supervised_tasks if task in completed
             )
+            ordered_pending = tuple(task for task in supervised_tasks if task in pending)
             if failures:
-                cleanup_failures = await _cancel_and_collect_failures(pending)
+                cleanup_failures = await _cancel_and_collect_failures(ordered_pending)
                 _raise_task_failures((*failures, *cleanup_failures))
 
             if heartbeat_task in completed:
                 heartbeat_outcome = heartbeat_task.result()
-                cleanup_failures = await _cancel_and_collect_failures(pending)
+                cleanup_failures = await _cancel_and_collect_failures(ordered_pending)
                 _raise_task_failures(cleanup_failures)
                 if heartbeat_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
                     return heartbeat_outcome
                 raise RuntimeError("execution heartbeat stopped before processing finished")
 
+            if processor_task in completed:
+                stop_event.set()
+                deadline_failures = await _cancel_and_collect_failures((deadline_task,))
+                _raise_task_failures(deadline_failures)
+                heartbeat_outcome = await heartbeat_task
+                if heartbeat_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
+                    return heartbeat_outcome
+                return processor_task.result()
+
+            processor_failures = await _cancel_and_collect_failures((processor_task,))
+            _raise_task_failures(processor_failures)
+            heartbeat_stopped_before_signal = heartbeat_task.done()
             stop_event.set()
             heartbeat_outcome = await heartbeat_task
             if heartbeat_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
                 return heartbeat_outcome
-            return processor_task.result()
+            if heartbeat_stopped_before_signal:
+                raise RuntimeError("execution heartbeat stopped before processing finished")
+            return _ProcessorFailed(
+                TaskProcessingError(
+                    PROCESSING_TIMEOUT_ERROR_CODE,
+                    retryable=True,
+                ),
+            )
         except BaseException as primary_error:
             stop_event.set()
             cleanup_failures = await _cancel_and_collect_failures(
@@ -353,6 +385,10 @@ async def _wait_for_heartbeat_stop(
             raise
         return False
     return True
+
+
+async def _wait_for_processing_deadline(*, timeout_seconds: float) -> None:
+    await asyncio.sleep(timeout_seconds)
 
 
 def _completed_task_failures(

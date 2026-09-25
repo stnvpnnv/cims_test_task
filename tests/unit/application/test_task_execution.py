@@ -35,6 +35,7 @@ _TASK_ID = UUID("038d7d21-b1b8-4ddd-a3ce-f9865132669d")
 _DISPATCH_TOKEN = UUID("93806a60-eb97-4b07-8244-f3a506479ef8")
 _EXECUTION_TOKEN = UUID("a73632c4-4e1d-419f-83f2-e8894ef69a58")
 _LEASE_DURATION = timedelta(seconds=60)
+_HEARTBEAT_INTERVAL = timedelta(seconds=15)
 _LEASE_EXPIRES_AT = datetime(2026, 9, 25, 2, 30, tzinfo=UTC)
 
 type FinalizationPath = Literal["completion", "retry", "failure"]
@@ -43,11 +44,12 @@ type FinalizationPath = Literal["completion", "retry", "failure"]
 @dataclass(frozen=True, slots=True)
 class _ExecutionHarness:
     executor: TaskExecutor
-    sessions: tuple[AsyncSession, AsyncSession]
-    transactions: tuple[AsyncMock, AsyncMock]
+    sessions: tuple[AsyncSession, ...]
+    transactions: tuple[AsyncMock, ...]
     begin: Mock
     repository_factory: Mock
     claim_for_execution: AsyncMock
+    renew_execution_lease: AsyncMock
     process: AsyncMock
     retry_delay_for_attempt: Mock
     complete_execution: AsyncMock
@@ -117,34 +119,55 @@ def _execution_harness(
     complete_result: bool = True,
     retry_result: bool = True,
     failure_result: bool = True,
+    heartbeat_interval: timedelta = _HEARTBEAT_INTERVAL,
+    heartbeat_transaction_count: int = 0,
+    renew_execution_lease: AsyncMock | None = None,
     claim_on_exit: Callable[[], None] | None = None,
     claim_exit_error: BaseException | None = None,
     final_exit_error: BaseException | None = None,
 ) -> _ExecutionHarness:
     claim_session = cast(AsyncSession, object())
+    heartbeat_sessions = tuple(
+        cast(AsyncSession, object()) for _ in range(heartbeat_transaction_count)
+    )
     final_session = cast(AsyncSession, object())
-    transactions = (
+    sessions = (claim_session, *heartbeat_sessions, final_session)
+    transactions = tuple(
         _transaction(
-            claim_session,
-            on_exit=claim_on_exit,
-            exit_error=claim_exit_error,
-        ),
-        _transaction(final_session, exit_error=final_exit_error),
+            session,
+            on_exit=claim_on_exit if index == 0 else None,
+            exit_error=(
+                claim_exit_error
+                if index == 0
+                else final_exit_error
+                if index == len(sessions) - 1
+                else None
+            ),
+        )
+        for index, session in enumerate(sessions)
     )
     begin = Mock(side_effect=transactions)
     session_factory = cast(AsyncSessionFactory, SimpleNamespace(begin=begin))
 
     claim_for_execution = AsyncMock(return_value=claimed)
+    renew_mock = (
+        renew_execution_lease if renew_execution_lease is not None else AsyncMock(return_value=True)
+    )
     complete_execution = AsyncMock(return_value=complete_result)
     schedule_execution_retry = AsyncMock(return_value=retry_result)
     fail_execution = AsyncMock(return_value=failure_result)
     claim_repository = SimpleNamespace(claim_for_execution=claim_for_execution)
+    heartbeat_repositories = tuple(
+        SimpleNamespace(renew_execution_lease=renew_mock) for _ in heartbeat_sessions
+    )
     final_repository = SimpleNamespace(
         complete_execution=complete_execution,
         schedule_execution_retry=schedule_execution_retry,
         fail_execution=fail_execution,
     )
-    repository_factory = Mock(side_effect=(claim_repository, final_repository))
+    repository_factory = Mock(
+        side_effect=(claim_repository, *heartbeat_repositories, final_repository),
+    )
     monkeypatch.setattr(
         task_execution_module,
         "TaskExecutionRepository",
@@ -162,20 +185,48 @@ def _execution_harness(
         session_factory,
         processor,
         lease_duration=_LEASE_DURATION,
+        heartbeat_interval=heartbeat_interval,
         retry_delay_for_attempt=retry_policy,
     )
     return _ExecutionHarness(
         executor=executor,
-        sessions=(claim_session, final_session),
+        sessions=sessions,
         transactions=transactions,
         begin=begin,
         repository_factory=repository_factory,
         claim_for_execution=claim_for_execution,
+        renew_execution_lease=renew_mock,
         process=process_mock,
         retry_delay_for_attempt=retry_policy,
         complete_execution=complete_execution,
         schedule_execution_retry=schedule_execution_retry,
         fail_execution=fail_execution,
+    )
+
+
+def _allow_heartbeat_renewals(
+    monkeypatch: pytest.MonkeyPatch,
+    count: int,
+) -> None:
+    remaining = count
+
+    async def wait_for_stop(
+        stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        nonlocal remaining
+        assert interval_seconds == _HEARTBEAT_INTERVAL.total_seconds()
+        if remaining > 0:
+            remaining -= 1
+            return False
+        await stop_event.wait()
+        return True
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        wait_for_stop,
     )
 
 
@@ -193,6 +244,44 @@ def test_executor_rejects_a_non_positive_lease_before_database_access(
             cast(AsyncSessionFactory, SimpleNamespace(begin=begin)),
             cast(TaskProcessor, SimpleNamespace(process=process)),
             lease_duration=lease_duration,
+            heartbeat_interval=_HEARTBEAT_INTERVAL,
+            retry_delay_for_attempt=Mock(),
+        )
+
+    begin.assert_not_called()
+    process.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_interval", "message"),
+    [
+        (timedelta(0), "heartbeat_interval must be positive"),
+        (timedelta(microseconds=-1), "heartbeat_interval must be positive"),
+        (
+            _LEASE_DURATION,
+            "heartbeat_interval must be shorter than lease_duration",
+        ),
+        (
+            _LEASE_DURATION + timedelta(microseconds=1),
+            "heartbeat_interval must be shorter than lease_duration",
+        ),
+    ],
+)
+def test_executor_rejects_an_invalid_heartbeat_before_database_access(
+    heartbeat_interval: timedelta,
+    message: str,
+) -> None:
+    """Heartbeat timing must leave a positive renewal window inside the lease."""
+
+    begin = Mock()
+    process = AsyncMock()
+
+    with pytest.raises(ValueError, match=rf"^{message}$"):
+        TaskExecutor(
+            cast(AsyncSessionFactory, SimpleNamespace(begin=begin)),
+            cast(TaskProcessor, SimpleNamespace(process=process)),
+            lease_duration=_LEASE_DURATION,
+            heartbeat_interval=heartbeat_interval,
             retry_delay_for_attempt=Mock(),
         )
 
@@ -255,6 +344,7 @@ async def test_success_commits_the_claim_before_processing_and_result(
     assert persisted_result["right"] is not shared_values
     harness.schedule_execution_retry.assert_not_awaited()
     harness.fail_execution.assert_not_awaited()
+    harness.renew_execution_lease.assert_not_awaited()
     assert harness.repository_factory.call_args_list == [
         call(harness.sessions[0]),
         call(harness.sessions[1]),
@@ -262,6 +352,626 @@ async def test_success_commits_the_claim_before_processing_and_result(
     assert harness.sessions[0] is not harness.sessions[1]
     for transaction in harness.transactions:
         transaction.__aexit__.assert_awaited_once_with(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_renews_the_execution_in_separate_transactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long processing renews its fenced lease without holding a database session."""
+
+    _allow_heartbeat_renewals(monkeypatch, 2)
+    processor_started = asyncio.Event()
+    release_processor = asyncio.Event()
+    renewal_count = 0
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        await release_processor.wait()
+        return {"processed": True}
+
+    async def renew_lease(*_args: object, **_kwargs: object) -> bool:
+        nonlocal renewal_count
+        assert processor_started.is_set()
+        renewal_count += 1
+        if renewal_count == 2:
+            release_processor.set()
+        return True
+
+    renew_execution_lease = AsyncMock(side_effect=renew_lease)
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=2,
+        renew_execution_lease=renew_execution_lease,
+    )
+
+    outcome = await asyncio.wait_for(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+        timeout=1,
+    )
+
+    assert outcome is TaskExecutionOutcome.COMPLETED
+    assert renew_execution_lease.await_args_list == [
+        call(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            lease_duration=_LEASE_DURATION,
+        ),
+        call(
+            _TASK_ID,
+            execution_token=_EXECUTION_TOKEN,
+            lease_duration=_LEASE_DURATION,
+        ),
+    ]
+    assert harness.repository_factory.call_args_list == [
+        call(harness.sessions[0]),
+        call(harness.sessions[1]),
+        call(harness.sessions[2]),
+        call(harness.sessions[3]),
+    ]
+    assert len({id(session) for session in harness.sessions}) == 4
+    for transaction in harness.transactions:
+        transaction.__aexit__.assert_awaited_once_with(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_finalization_waits_for_an_in_flight_heartbeat_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker stops and reaps renewal before it writes a terminal outcome."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    release_processor = asyncio.Event()
+    heartbeat_commit_started = asyncio.Event()
+    allow_heartbeat_commit = asyncio.Event()
+    heartbeat_committed = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        await release_processor.wait()
+        return {"processed": True}
+
+    async def renew_lease(*_args: object, **_kwargs: object) -> bool:
+        release_processor.set()
+        return True
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=renew_lease),
+    )
+
+    async def commit_heartbeat(
+        _exception_type: type[BaseException] | None,
+        _exception: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> bool:
+        heartbeat_commit_started.set()
+        await allow_heartbeat_commit.wait()
+        heartbeat_committed.set()
+        return False
+
+    harness.transactions[1].__aexit__.side_effect = commit_heartbeat
+
+    def complete_after_heartbeat(*_args: object, **_kwargs: object) -> bool:
+        assert heartbeat_committed.is_set()
+        return True
+
+    harness.complete_execution.side_effect = complete_after_heartbeat
+    execution = asyncio.create_task(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+    )
+
+    await asyncio.wait_for(heartbeat_commit_started.wait(), timeout=1)
+    await asyncio.sleep(0)
+    harness.complete_execution.assert_not_awaited()
+    assert not execution.done()
+
+    allow_heartbeat_commit.set()
+    outcome = await asyncio.wait_for(execution, timeout=1)
+
+    assert outcome is TaskExecutionOutcome.COMPLETED
+    harness.transactions[1].__aexit__.assert_awaited_once_with(None, None, None)
+    harness.transactions[2].__aenter__.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_lost_heartbeat_ownership_cancels_and_reaps_the_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed fenced renewal wins the race and prevents stale finalization."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    processor_started = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    renew_execution_lease = AsyncMock(return_value=False)
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=renew_execution_lease,
+    )
+
+    outcome = await asyncio.wait_for(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+        timeout=1,
+    )
+
+    assert outcome is TaskExecutionOutcome.LOST_OWNERSHIP
+    assert processor_started.is_set()
+    assert processor_reaped.is_set()
+    renew_execution_lease.assert_awaited_once_with(
+        _TASK_ID,
+        execution_token=_EXECUTION_TOKEN,
+        lease_duration=_LEASE_DURATION,
+    )
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+    assert harness.begin.call_count == 2
+    harness.transactions[2].__aenter__.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lost_ownership_preserves_a_processor_error_after_wait_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup retains an error from a task that finished after wait classified it pending."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    cleanup_error = RuntimeError("processor cancellation cleanup failed")
+    processor_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            raise cleanup_error
+
+    original_wait = asyncio.wait
+
+    async def wait_after_pending_finishes(
+        tasks: tuple[asyncio.Task[object], ...],
+        *,
+        return_when: str,
+    ) -> tuple[set[asyncio.Task[object]], set[asyncio.Task[object]]]:
+        supervised = set(tasks)
+        completed, pending = await original_wait(
+            supervised,
+            return_when=return_when,
+        )
+        assert len(completed) == 1
+        assert len(pending) == 1
+        pending_task = next(iter(pending))
+        pending_task.cancel()
+        await asyncio.gather(pending_task, return_exceptions=True)
+        return completed, pending
+
+    monkeypatch.setattr(asyncio, "wait", wait_after_pending_finishes)
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(return_value=False),
+    )
+
+    async with asyncio.timeout(1):
+        with pytest.raises(
+            RuntimeError,
+            match=r"^processor cancellation cleanup failed$",
+        ) as error_info:
+            await harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN)
+
+    assert error_info.value is cleanup_error
+    assert processor_started.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_query_failure_cancels_processor_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renewal database error fails fast and leaves the execution to recovery."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    expected_error = OSError("heartbeat query failed")
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=expected_error),
+    )
+
+    with pytest.raises(OSError, match=r"^heartbeat query failed$") as error_info:
+        await asyncio.wait_for(
+            harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+            timeout=1,
+        )
+
+    assert error_info.value is expected_error
+    assert processor_reaped.is_set()
+    heartbeat_exit = harness.transactions[1].__aexit__.await_args
+    assert heartbeat_exit is not None
+    assert heartbeat_exit.args[0] is OSError
+    assert heartbeat_exit.args[1] is expected_error
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_and_processor_cleanup_failures_are_grouped_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent supervisor failures retain identity without duplicate group leaves."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    heartbeat_error = OSError("heartbeat query failed")
+    processor_cleanup_error = RuntimeError("processor cancellation cleanup failed")
+    processor_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            raise processor_cleanup_error
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=heartbeat_error),
+    )
+
+    with pytest.raises(BaseExceptionGroup) as error_info:
+        await asyncio.wait_for(
+            harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+            timeout=1,
+        )
+
+    grouped_errors = error_info.value.exceptions
+    assert grouped_errors == (heartbeat_error, processor_cleanup_error)
+    assert processor_started.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_commit_failure_cancels_processor_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncertain renewal commit cannot be treated as retained ownership."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    expected_error = OSError("heartbeat commit outcome unknown")
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+    )
+    harness.transactions[1].__aexit__.side_effect = expected_error
+
+    with pytest.raises(
+        OSError,
+        match=r"^heartbeat commit outcome unknown$",
+    ) as error_info:
+        await asyncio.wait_for(
+            harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+            timeout=1,
+        )
+
+    assert error_info.value is expected_error
+    assert processor_reaped.is_set()
+    harness.renew_execution_lease.assert_awaited_once()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_reaps_processor_and_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shutdown cancellation leaves no owned child task or durable finalization."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    processor_started = asyncio.Event()
+    processor_reaped = asyncio.Event()
+    heartbeat_started = asyncio.Event()
+    heartbeat_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    async def renew_lease(*_args: object, **_kwargs: object) -> bool:
+        heartbeat_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            heartbeat_reaped.set()
+        raise AssertionError("unreachable")
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=renew_lease),
+    )
+    execution = asyncio.create_task(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+    )
+
+    await asyncio.wait_for(processor_started.wait(), timeout=1)
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+    execution.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert processor_reaped.is_set()
+    assert heartbeat_reaped.is_set()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+    harness.transactions[2].__aenter__.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cannot_stop_normally_while_processor_is_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An impossible early stop fails fast instead of silently losing supervision."""
+
+    processor_reaped = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def stop_heartbeat(
+        _stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        assert interval_seconds > 0
+        return True
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        try:
+            await never_finish.wait()
+        finally:
+            processor_reaped.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        stop_heartbeat,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^execution heartbeat stopped before processing finished$",
+    ):
+        await asyncio.wait_for(
+            harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+            timeout=1,
+        )
+
+    assert processor_reaped.is_set()
+    harness.renew_execution_lease.assert_not_awaited()
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lost_ownership_wins_after_processor_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A renewal already in flight can fence a result that has just become ready."""
+
+    heartbeat_stopped = asyncio.Event()
+    heartbeat_query_started = asyncio.Event()
+    allow_heartbeat_query = asyncio.Event()
+    release_processor = asyncio.Event()
+    processor_returned = asyncio.Event()
+
+    async def begin_heartbeat(
+        stop_event: asyncio.Event,
+        *,
+        interval_seconds: float,
+    ) -> bool:
+        assert interval_seconds > 0
+        set_stop_event = stop_event.set
+
+        def record_heartbeat_stop() -> None:
+            set_stop_event()
+            heartbeat_stopped.set()
+
+        monkeypatch.setattr(stop_event, "set", record_heartbeat_stop)
+        return False
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        await release_processor.wait()
+        processor_returned.set()
+        return {"processed": True}
+
+    async def lose_ownership(*_args: object, **_kwargs: object) -> bool:
+        heartbeat_query_started.set()
+        await allow_heartbeat_query.wait()
+        return False
+
+    monkeypatch.setattr(
+        task_execution_module,
+        "_wait_for_heartbeat_stop",
+        begin_heartbeat,
+    )
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=lose_ownership),
+    )
+    execution = asyncio.create_task(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+    )
+
+    await asyncio.wait_for(heartbeat_query_started.wait(), timeout=1)
+    release_processor.set()
+    await asyncio.wait_for(processor_returned.wait(), timeout=1)
+    await asyncio.wait_for(heartbeat_stopped.wait(), timeout=1)
+    allow_heartbeat_query.set()
+    outcome = await asyncio.wait_for(execution, timeout=1)
+
+    assert outcome is TaskExecutionOutcome.LOST_OWNERSHIP
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+    harness.transactions[2].__aenter__.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_preserves_child_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent cleanup defects remain visible alongside shutdown cancellation."""
+
+    _allow_heartbeat_renewals(monkeypatch, 1)
+    processor_cleanup_error = RuntimeError("processor cancellation cleanup failed")
+    heartbeat_cleanup_error = OSError("heartbeat cancellation cleanup failed")
+    processor_started = asyncio.Event()
+    heartbeat_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def process_task(_task: TaskProcessingInput) -> JsonObject:
+        processor_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            raise processor_cleanup_error
+
+    async def renew_lease(*_args: object, **_kwargs: object) -> bool:
+        heartbeat_started.set()
+        try:
+            await never_finish.wait()
+        finally:
+            raise heartbeat_cleanup_error
+
+    harness = _execution_harness(
+        monkeypatch,
+        _claimed_execution(),
+        process=AsyncMock(side_effect=process_task),
+        heartbeat_transaction_count=1,
+        renew_execution_lease=AsyncMock(side_effect=renew_lease),
+    )
+    execution = asyncio.create_task(
+        harness.executor.execute(_TASK_ID, dispatch_token=_DISPATCH_TOKEN),
+    )
+
+    await asyncio.wait_for(processor_started.wait(), timeout=1)
+    await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+    execution.cancel()
+
+    with pytest.raises(BaseExceptionGroup) as error_info:
+        await execution
+
+    grouped_errors = error_info.value.exceptions
+    assert len(grouped_errors) == 3
+    assert isinstance(grouped_errors[0], asyncio.CancelledError)
+    assert grouped_errors[1] is processor_cleanup_error
+    assert grouped_errors[2] is heartbeat_cleanup_error
+    harness.complete_execution.assert_not_awaited()
+    harness.schedule_execution_retry.assert_not_awaited()
+    harness.fail_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wait_reports_its_own_elapsed_interval() -> None:
+    """An elapsed heartbeat timer requests a renewal without leaking TimeoutError."""
+
+    stopped = await asyncio.wait_for(
+        task_execution_module._wait_for_heartbeat_stop(
+            asyncio.Event(),
+            interval_seconds=0.001,
+        ),
+        timeout=1,
+    )
+
+    assert stopped is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wait_preserves_an_unrelated_timeout_error() -> None:
+    """A TimeoutError raised by the awaited operation is not mistaken for the timer."""
+
+    expected_error = TimeoutError("event wait failed")
+    wait = AsyncMock(side_effect=expected_error)
+    stop_event = cast(asyncio.Event, SimpleNamespace(wait=wait))
+
+    with pytest.raises(TimeoutError, match=r"^event wait failed$") as error_info:
+        await task_execution_module._wait_for_heartbeat_stop(
+            stop_event,
+            interval_seconds=1,
+        )
+
+    assert error_info.value is expected_error
+    wait.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

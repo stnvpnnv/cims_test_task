@@ -1,10 +1,12 @@
 """Orchestrate one fenced task execution outside database transactions."""
 
+import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
-from enum import StrEnum
-from typing import Final
+from enum import Enum, StrEnum
+from typing import Final, Literal
 from uuid import UUID
 
 from pydantic import ConfigDict, TypeAdapter
@@ -44,6 +46,27 @@ class TaskExecutionOutcome(StrEnum):
     LOST_OWNERSHIP = "lost_ownership"
 
 
+class _HeartbeatOutcome(Enum):
+    STOPPED = "stopped"
+    LOST_OWNERSHIP = "lost_ownership"
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessorSucceeded:
+    result: JsonObject
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessorFailed:
+    error: TaskProcessingError
+
+
+type _CapturedProcessorOutcome = _ProcessorSucceeded | _ProcessorFailed
+type _SupervisedProcessorOutcome = (
+    _CapturedProcessorOutcome | Literal[_HeartbeatOutcome.LOST_OWNERSHIP]
+)
+
+
 class _InvalidProcessorResultError(ValueError):
     """Internal marker for values that cannot cross the JSON result boundary."""
 
@@ -57,14 +80,20 @@ class TaskExecutor:
         processor: TaskProcessor,
         *,
         lease_duration: timedelta,
+        heartbeat_interval: timedelta,
         retry_delay_for_attempt: RetryDelayForAttempt,
     ) -> None:
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
+        if heartbeat_interval <= timedelta(0):
+            raise ValueError("heartbeat_interval must be positive")
+        if heartbeat_interval >= lease_duration:
+            raise ValueError("heartbeat_interval must be shorter than lease_duration")
 
         self._session_factory = session_factory
         self._processor = processor
         self._lease_duration = lease_duration
+        self._heartbeat_interval = heartbeat_interval
         self._retry_delay_for_attempt = retry_delay_for_attempt
 
     async def execute(
@@ -87,13 +116,14 @@ class TaskExecutor:
             attempt_count=claimed.attempt_count,
             max_attempts=claimed.max_attempts,
         )
-        try:
-            raw_result = await self._processor.process(processing_input)
-        except TaskProcessingError as error:
-            return await self._finalize_processing_error(claimed, error)
+        processing_outcome = await self._process_with_heartbeat(claimed, processing_input)
+        if processing_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
+            return TaskExecutionOutcome.LOST_OWNERSHIP
+        if isinstance(processing_outcome, _ProcessorFailed):
+            return await self._finalize_processing_error(claimed, processing_outcome.error)
 
         try:
-            result = _validate_processor_result(raw_result)
+            result = _validate_processor_result(processing_outcome.result)
         except _InvalidProcessorResultError:
             return await self._fail(
                 claimed,
@@ -119,6 +149,100 @@ class TaskExecutor:
             )
 
         return claimed
+
+    async def _process_with_heartbeat(
+        self,
+        claimed: ClaimedTaskExecution,
+        processing_input: TaskProcessingInput,
+    ) -> _SupervisedProcessorOutcome:
+        stop_event = asyncio.Event()
+        processor_task = asyncio.create_task(
+            self._capture_processor_outcome(processing_input),
+            name=f"task-processor-{claimed.task_id}",
+        )
+        heartbeat_task = asyncio.create_task(
+            self._run_heartbeat(claimed, stop_event=stop_event),
+            name=f"task-heartbeat-{claimed.task_id}",
+        )
+        supervised_tasks: tuple[asyncio.Task[object], ...] = (
+            processor_task,
+            heartbeat_task,
+        )
+
+        try:
+            completed, pending = await asyncio.wait(
+                supervised_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            failures = _completed_task_failures(
+                task for task in supervised_tasks if task in completed
+            )
+            if failures:
+                cleanup_failures = await _cancel_and_collect_failures(pending)
+                _raise_task_failures((*failures, *cleanup_failures))
+
+            if heartbeat_task in completed:
+                heartbeat_outcome = heartbeat_task.result()
+                cleanup_failures = await _cancel_and_collect_failures(pending)
+                _raise_task_failures(cleanup_failures)
+                if heartbeat_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
+                    return heartbeat_outcome
+                raise RuntimeError("execution heartbeat stopped before processing finished")
+
+            stop_event.set()
+            heartbeat_outcome = await heartbeat_task
+            if heartbeat_outcome is _HeartbeatOutcome.LOST_OWNERSHIP:
+                return heartbeat_outcome
+            return processor_task.result()
+        except BaseException as primary_error:
+            stop_event.set()
+            cleanup_failures = await _cancel_and_collect_failures(
+                supervised_tasks,
+                exclude=primary_error,
+            )
+            if cleanup_failures:
+                _raise_task_failures((primary_error, *cleanup_failures))
+            raise
+
+    async def _capture_processor_outcome(
+        self,
+        processing_input: TaskProcessingInput,
+    ) -> _CapturedProcessorOutcome:
+        try:
+            result = await self._processor.process(processing_input)
+        except TaskProcessingError as error:
+            return _ProcessorFailed(error)
+        return _ProcessorSucceeded(result)
+
+    async def _run_heartbeat(
+        self,
+        claimed: ClaimedTaskExecution,
+        *,
+        stop_event: asyncio.Event,
+    ) -> _HeartbeatOutcome:
+        interval_seconds = self._heartbeat_interval.total_seconds()
+        while not stop_event.is_set():
+            if await _wait_for_heartbeat_stop(
+                stop_event,
+                interval_seconds=interval_seconds,
+            ):
+                return _HeartbeatOutcome.STOPPED
+
+            renewed = await self._renew_execution_lease(claimed)
+            if not renewed:
+                return _HeartbeatOutcome.LOST_OWNERSHIP
+
+        return _HeartbeatOutcome.STOPPED
+
+    async def _renew_execution_lease(self, claimed: ClaimedTaskExecution) -> bool:
+        async with self._session_factory.begin() as session:
+            renewed = await TaskExecutionRepository(session).renew_execution_lease(
+                claimed.task_id,
+                execution_token=claimed.execution_token,
+                lease_duration=self._lease_duration,
+            )
+
+        return renewed
 
     async def _finalize_processing_error(
         self,
@@ -213,3 +337,72 @@ def _contains_unsupported_jsonb_text(value: JsonValue) -> bool:
             for key, item in value.items()
         )
     return False
+
+
+async def _wait_for_heartbeat_stop(
+    stop_event: asyncio.Event,
+    *,
+    interval_seconds: float,
+) -> bool:
+    heartbeat_timeout = asyncio.timeout(interval_seconds)
+    try:
+        async with heartbeat_timeout:
+            await stop_event.wait()
+    except TimeoutError:
+        if not heartbeat_timeout.expired():
+            raise
+        return False
+    return True
+
+
+def _completed_task_failures(
+    tasks: Iterable[asyncio.Task[object]],
+) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
+    for task in tasks:
+        try:
+            task.result()
+        except BaseException as error:
+            failures.append(error)
+    return tuple(failures)
+
+
+async def _cancel_and_collect_failures(
+    tasks: Iterable[asyncio.Task[object]],
+    *,
+    exclude: BaseException | None = None,
+) -> tuple[BaseException, ...]:
+    supervised = tuple(tasks)
+    for task in supervised:
+        if not task.done():
+            task.cancel()
+    results = await asyncio.gather(*supervised, return_exceptions=True)
+    excluded_error_ids = _exception_tree_ids(exclude)
+    return tuple(
+        result
+        for result in results
+        if isinstance(result, BaseException)
+        and not isinstance(result, asyncio.CancelledError)
+        and id(result) not in excluded_error_ids
+    )
+
+
+def _exception_tree_ids(error: BaseException | None) -> frozenset[int]:
+    if error is None:
+        return frozenset()
+
+    error_ids: set[int] = set()
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        error_ids.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    return frozenset(error_ids)
+
+
+def _raise_task_failures(failures: Sequence[BaseException]) -> None:
+    if len(failures) == 1:
+        raise failures[0]
+    if failures:
+        raise BaseExceptionGroup("task execution supervision failed", list(failures))

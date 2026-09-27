@@ -3,7 +3,7 @@
 import asyncio
 import json
 from math import isfinite
-from typing import Final, cast
+from typing import cast
 
 from aio_pika import DeliveryMode, Message
 from aio_pika.abc import (
@@ -13,11 +13,12 @@ from aio_pika.abc import (
 )
 
 from cims_task_service.infrastructure.database.outbox_repository import ClaimedOutboxEvent
-from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
-
-_APPLICATION_ID: Final = "cims-task-service"
-_JSON_CONTENT_TYPE: Final = "application/json"
-_UTF8_ENCODING: Final = "utf-8"
+from cims_task_service.infrastructure.messaging.task_message import (
+    TASK_MESSAGE_APPLICATION_ID,
+    TASK_MESSAGE_CONTENT_ENCODING,
+    TASK_MESSAGE_CONTENT_TYPE,
+    TASK_ROUTING_KEY,
+)
 
 
 async def open_publisher_channel(
@@ -62,18 +63,18 @@ class RabbitMQTaskPublisher:
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode(_UTF8_ENCODING)
+        ).encode(TASK_MESSAGE_CONTENT_ENCODING)
         message = Message(
             body,
-            content_type=_JSON_CONTENT_TYPE,
-            content_encoding=_UTF8_ENCODING,
+            content_type=TASK_MESSAGE_CONTENT_TYPE,
+            content_encoding=TASK_MESSAGE_CONTENT_ENCODING,
             delivery_mode=DeliveryMode.PERSISTENT,
             priority=event.message_priority,
             correlation_id=str(event.task_id),
             message_id=str(event.id),
             timestamp=event.created_at,
             type=event.event_type,
-            app_id=_APPLICATION_ID,
+            app_id=TASK_MESSAGE_APPLICATION_ID,
         )
 
         async with asyncio.timeout(self._publish_timeout_seconds):

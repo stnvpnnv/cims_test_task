@@ -13,10 +13,18 @@ from aio_pika.abc import (
 )
 
 from cims_task_service.domain.task import TaskPriority
+from cims_task_service.infrastructure.messaging.task_message import (
+    TASK_MESSAGE_HIGH_PRIORITY,
+    TASK_MESSAGE_LOW_PRIORITY,
+    TASK_MESSAGE_MEDIUM_PRIORITY,
+)
+from cims_task_service.infrastructure.messaging.task_message import (
+    TASK_ROUTING_KEY as _TASK_ROUTING_KEY,
+)
 
 TASK_EXCHANGE_NAME = "cims.tasks"
 TASK_QUEUE_NAME = "cims.tasks.execute.v1"
-TASK_ROUTING_KEY = "task.execute.v1"
+TASK_ROUTING_KEY: Final = _TASK_ROUTING_KEY
 
 DEAD_LETTER_EXCHANGE_NAME = "cims.tasks.dead-letter"
 DEAD_LETTER_QUEUE_NAME = "cims.tasks.dead-letter.v1"
@@ -24,9 +32,9 @@ DEAD_LETTER_ROUTING_KEY = "task.dead-letter.v1"
 
 _TASK_MESSAGE_PRIORITIES: Final[Mapping[TaskPriority, int]] = MappingProxyType(
     {
-        TaskPriority.LOW: 1,
-        TaskPriority.MEDIUM: 2,
-        TaskPriority.HIGH: 3,
+        TaskPriority.LOW: TASK_MESSAGE_LOW_PRIORITY,
+        TaskPriority.MEDIUM: TASK_MESSAGE_MEDIUM_PRIORITY,
+        TaskPriority.HIGH: TASK_MESSAGE_HIGH_PRIORITY,
     }
 )
 

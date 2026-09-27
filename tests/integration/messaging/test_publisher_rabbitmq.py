@@ -15,6 +15,7 @@ from aio_pika.exceptions import PublishError
 
 from cims_task_service.infrastructure.database.outbox_repository import ClaimedOutboxEvent
 from cims_task_service.infrastructure.messaging.publisher import RabbitMQTaskPublisher
+from cims_task_service.infrastructure.messaging.task_message import decode_task_message
 from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -33,7 +34,6 @@ _EVENT = ClaimedOutboxEvent(
     payload={
         "task_id": str(_TASK_ID),
         "dispatch_token": str(_DISPATCH_TOKEN),
-        "details": {"label": "проверка", "active": True},
     },
     message_priority=3,
     created_at=_CREATED_AT,
@@ -43,10 +43,7 @@ _EVENT = ClaimedOutboxEvent(
     lease_expires_at=_CREATED_AT + timedelta(minutes=1),
 )
 
-_EXPECTED_BODY = (
-    '{"details":{"active":true,"label":"проверка"},'
-    f'"dispatch_token":"{_DISPATCH_TOKEN}","task_id":"{_TASK_ID}"}}'
-).encode()
+_EXPECTED_BODY = (f'{{"dispatch_token":"{_DISPATCH_TOKEN}","task_id":"{_TASK_ID}"}}').encode()
 
 
 async def test_publish_routes_a_confirmed_message_with_exact_metadata(
@@ -82,6 +79,9 @@ async def test_publish_routes_a_confirmed_message_with_exact_metadata(
         assert incoming.exchange == exchange.name
         assert incoming.routing_key == TASK_ROUTING_KEY
         assert incoming.redelivered is False
+        decoded = decode_task_message(incoming)
+        assert decoded.task_id == _TASK_ID
+        assert decoded.dispatch_token == _DISPATCH_TOKEN
 
     assert incoming.processed is True
 

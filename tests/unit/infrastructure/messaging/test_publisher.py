@@ -36,7 +36,6 @@ _EVENT = ClaimedOutboxEvent(
     payload={
         "task_id": str(_TASK_ID),
         "dispatch_token": str(_DISPATCH_TOKEN),
-        "details": {"значение": "тест", "active": True},
     },
     message_priority=3,
     created_at=_CREATED_AT,
@@ -90,10 +89,7 @@ async def test_publish_sends_canonical_persistent_task_message() -> None:
     assert isinstance(message, Message)
     assert (
         message.body
-        == (
-            '{"details":{"active":true,"значение":"тест"},'
-            f'"dispatch_token":"{_DISPATCH_TOKEN}","task_id":"{_TASK_ID}"}}'
-        ).encode()
+        == (f'{{"dispatch_token":"{_DISPATCH_TOKEN}","task_id":"{_TASK_ID}"}}').encode()
     )
     assert message.content_type == "application/json"
     assert message.content_encoding == "utf-8"

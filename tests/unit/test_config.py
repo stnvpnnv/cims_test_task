@@ -22,6 +22,9 @@ _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS",
     "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
     "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
+)
+
+_EXECUTION_RETRY_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
     "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
 )
@@ -48,6 +51,7 @@ _SETTINGS_ENVIRONMENT_VARIABLES = (
     "CIMS_EXECUTION_RECOVERY_BATCH_SIZE",
     "CIMS_WORKER_CONCURRENCY",
     *_DISPATCHER_DURATION_ENVIRONMENT_VARIABLES,
+    *_EXECUTION_RETRY_DURATION_ENVIRONMENT_VARIABLES,
     *_WORKER_DURATION_ENVIRONMENT_VARIABLES,
 )
 
@@ -176,6 +180,8 @@ def test_worker_settings_have_coherent_defaults() -> None:
     assert settings.worker_heartbeat_interval_seconds == 15.0
     assert settings.worker_processing_timeout_seconds == 300.0
     assert settings.worker_shutdown_grace_seconds == 45.0
+    assert settings.execution_retry_initial_delay_seconds == 5.0
+    assert settings.execution_retry_maximum_delay_seconds == 300.0
 
 
 def test_worker_settings_load_environment_overrides(
@@ -188,6 +194,8 @@ def test_worker_settings_load_environment_overrides(
     monkeypatch.setenv("CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS", "12.5")
     monkeypatch.setenv("CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS", "240")
     monkeypatch.setenv("CIMS_WORKER_SHUTDOWN_GRACE_SECONDS", "20.5")
+    monkeypatch.setenv("CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS", "7.5")
+    monkeypatch.setenv("CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS", "240")
 
     settings = WorkerSettings()
 
@@ -196,6 +204,8 @@ def test_worker_settings_load_environment_overrides(
     assert settings.worker_heartbeat_interval_seconds == 12.5
     assert settings.worker_processing_timeout_seconds == 240.0
     assert settings.worker_shutdown_grace_seconds == 20.5
+    assert settings.execution_retry_initial_delay_seconds == 7.5
+    assert settings.execution_retry_maximum_delay_seconds == 240.0
 
 
 @pytest.mark.parametrize(
@@ -234,14 +244,6 @@ def test_worker_settings_load_environment_overrides(
             "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
             "execution_recovery_poll_interval_seconds",
         ),
-        (
-            "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
-            "execution_retry_initial_delay_seconds",
-        ),
-        (
-            "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
-            "execution_retry_maximum_delay_seconds",
-        ),
     ],
 )
 @pytest.mark.parametrize("settings_type", [Settings, WorkerSettings])
@@ -256,6 +258,33 @@ def test_non_dispatcher_settings_ignore_dispatcher_only_environment(
     monkeypatch.setenv(variable_name, "not-a-valid-value")
 
     settings = settings_type()
+
+    assert not hasattr(settings, attribute_name)
+
+
+@pytest.mark.parametrize(
+    ("variable_name", "attribute_name"),
+    [
+        (
+            "CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS",
+            "execution_retry_initial_delay_seconds",
+        ),
+        (
+            "CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS",
+            "execution_retry_maximum_delay_seconds",
+        ),
+    ],
+)
+def test_base_settings_ignore_execution_retry_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    variable_name: str,
+    attribute_name: str,
+) -> None:
+    """The API process ignores execution retry settings used by background jobs."""
+
+    monkeypatch.setenv(variable_name, "not-a-valid-value")
+
+    settings = Settings()
 
     assert not hasattr(settings, attribute_name)
 
@@ -539,6 +568,46 @@ def test_dispatcher_durations_must_be_finite(
         DispatcherSettings()
 
 
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
+@pytest.mark.parametrize(
+    "variable_name",
+    _EXECUTION_RETRY_DURATION_ENVIRONMENT_VARIABLES,
+)
+@pytest.mark.parametrize("invalid_value", ["0", "-0.1"])
+def test_execution_retry_durations_must_be_positive(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Settings],
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """Execution retry delays are positive in every process that consumes them."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        settings_type()
+
+
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
+@pytest.mark.parametrize(
+    "variable_name",
+    _EXECUTION_RETRY_DURATION_ENVIRONMENT_VARIABLES,
+)
+@pytest.mark.parametrize("invalid_value", ["nan", "inf", "-inf"])
+def test_execution_retry_durations_must_be_finite(
+    monkeypatch: pytest.MonkeyPatch,
+    settings_type: type[Settings],
+    variable_name: str,
+    invalid_value: str,
+) -> None:
+    """Execution retry scheduling never receives an IEEE special value."""
+
+    monkeypatch.setenv(variable_name, invalid_value)
+
+    with pytest.raises(ValidationError):
+        settings_type()
+
+
 def test_dispatcher_retry_maximum_must_cover_the_initial_delay() -> None:
     """A capped backoff cannot start above its own maximum."""
 
@@ -570,43 +639,60 @@ def test_dispatcher_retry_delay_allows_a_fixed_cap() -> None:
         "execution_retry_maximum_delay_seconds",
     ],
 )
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
 def test_execution_retry_delay_rejects_values_above_one_day(
+    settings_type: type[Settings],
     field_name: str,
 ) -> None:
-    """Execution recovery cannot schedule unexpectedly distant retries."""
+    """The shared execution policy cannot schedule unexpectedly distant retries."""
 
     with pytest.raises(ValidationError):
-        DispatcherSettings.model_validate({field_name: 86_400.000_001})
+        settings_type.model_validate({field_name: 86_400.000_001})
 
 
-def test_execution_retry_maximum_must_cover_the_initial_delay() -> None:
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
+def test_execution_retry_maximum_must_cover_the_initial_delay(
+    settings_type: type[Settings],
+) -> None:
     """An execution backoff cannot start above its own maximum."""
 
     with pytest.raises(ValidationError, match="execution retry maximum delay"):
-        DispatcherSettings(
-            execution_retry_initial_delay_seconds=2.0,
-            execution_retry_maximum_delay_seconds=1.0,
+        settings_type.model_validate(
+            {
+                "execution_retry_initial_delay_seconds": 2.0,
+                "execution_retry_maximum_delay_seconds": 1.0,
+            }
         )
 
 
-def test_execution_retry_delay_allows_a_fixed_cap() -> None:
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
+def test_execution_retry_delay_allows_a_fixed_cap(
+    settings_type: type[DispatcherSettings] | type[WorkerSettings],
+) -> None:
     """Equal bounds intentionally produce a capped jitter-only retry delay."""
 
-    settings = DispatcherSettings(
-        execution_retry_initial_delay_seconds=2.0,
-        execution_retry_maximum_delay_seconds=2.0,
+    settings = settings_type.model_validate(
+        {
+            "execution_retry_initial_delay_seconds": 2.0,
+            "execution_retry_maximum_delay_seconds": 2.0,
+        }
     )
 
     assert settings.execution_retry_initial_delay_seconds == 2.0
     assert settings.execution_retry_maximum_delay_seconds == 2.0
 
 
-def test_execution_retry_delay_accepts_one_day_limit() -> None:
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
+def test_execution_retry_delay_accepts_one_day_limit(
+    settings_type: type[DispatcherSettings] | type[WorkerSettings],
+) -> None:
     """The documented upper bound itself remains a valid deployment value."""
 
-    settings = DispatcherSettings(
-        execution_retry_initial_delay_seconds=86_400.0,
-        execution_retry_maximum_delay_seconds=86_400.0,
+    settings = settings_type.model_validate(
+        {
+            "execution_retry_initial_delay_seconds": 86_400.0,
+            "execution_retry_maximum_delay_seconds": 86_400.0,
+        }
     )
 
     assert settings.execution_retry_initial_delay_seconds == 86_400.0
@@ -687,13 +773,15 @@ def test_dispatcher_rejects_durations_that_round_to_zero(
         "execution_retry_maximum_delay_seconds",
     ],
 )
+@pytest.mark.parametrize("settings_type", [DispatcherSettings, WorkerSettings])
 def test_execution_retry_rejects_durations_that_round_to_zero(
+    settings_type: type[Settings],
     field_name: str,
 ) -> None:
     """Execution retry durations remain positive after timedelta conversion."""
 
     with pytest.raises(ValidationError, match="execution retry delays"):
-        DispatcherSettings.model_validate({field_name: 1e-10})
+        settings_type.model_validate({field_name: 1e-10})
 
 
 @pytest.mark.parametrize(

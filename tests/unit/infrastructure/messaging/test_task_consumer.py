@@ -10,6 +10,8 @@ import pytest
 from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractQueueIterator,
+    AbstractRobustChannel,
+    AbstractRobustConnection,
     AbstractRobustQueue,
 )
 
@@ -19,6 +21,7 @@ from cims_task_service.infrastructure.messaging.task_consumer import (
     TaskDeliveryCancelledError,
     TaskDeliveryHandler,
     TaskDeliveryRequeueCancelledError,
+    open_consumer_channel,
     run_task_consumer,
 )
 
@@ -313,6 +316,91 @@ async def _wait(event: asyncio.Event) -> None:
 async def _finish(task: asyncio.Task[None]) -> None:
     async with asyncio.timeout(1):
         await task
+
+
+@pytest.mark.asyncio
+async def test_consumer_channel_disables_confirms_and_limits_delivery_credit() -> None:
+    """The dedicated robust channel exposes only the configured worker capacity."""
+
+    set_qos = AsyncMock()
+    close = AsyncMock()
+    expected_channel = cast(
+        AbstractRobustChannel,
+        SimpleNamespace(set_qos=set_qos, close=close),
+    )
+    channel_result: asyncio.Future[AbstractRobustChannel] = (
+        asyncio.get_running_loop().create_future()
+    )
+    channel_result.set_result(expected_channel)
+    channel = Mock(return_value=channel_result)
+    connection = cast(AbstractRobustConnection, SimpleNamespace(channel=channel))
+
+    opened = await open_consumer_channel(connection, prefetch_count=7)
+
+    assert opened is expected_channel
+    channel.assert_called_once_with(
+        publisher_confirms=False,
+        on_return_raises=False,
+    )
+    set_qos.assert_awaited_once_with(
+        prefetch_count=7,
+        prefetch_size=0,
+        global_=False,
+    )
+    close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefetch_count", [0, -1])
+async def test_consumer_channel_rejects_non_positive_prefetch_before_broker_access(
+    prefetch_count: int,
+) -> None:
+    """Invalid delivery credit cannot allocate a broker channel."""
+
+    channel = Mock()
+    connection = cast(AbstractRobustConnection, SimpleNamespace(channel=channel))
+
+    with pytest.raises(ValueError, match=r"^prefetch_count must be at least 1$"):
+        await open_consumer_channel(connection, prefetch_count=prefetch_count)
+
+    channel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_consumer_channel_closes_after_qos_base_exception() -> None:
+    """Failed QoS setup cannot leak a channel or replace the original failure."""
+
+    class FatalQosError(BaseException):
+        pass
+
+    expected_error = FatalQosError()
+    set_qos = AsyncMock(side_effect=expected_error)
+    close = AsyncMock()
+    expected_channel = cast(
+        AbstractRobustChannel,
+        SimpleNamespace(set_qos=set_qos, close=close),
+    )
+    channel_result: asyncio.Future[AbstractRobustChannel] = (
+        asyncio.get_running_loop().create_future()
+    )
+    channel_result.set_result(expected_channel)
+    channel = Mock(return_value=channel_result)
+    connection = cast(AbstractRobustConnection, SimpleNamespace(channel=channel))
+
+    with pytest.raises(FatalQosError) as error_info:
+        await open_consumer_channel(connection, prefetch_count=3)
+
+    assert error_info.value is expected_error
+    channel.assert_called_once_with(
+        publisher_confirms=False,
+        on_return_raises=False,
+    )
+    set_qos.assert_awaited_once_with(
+        prefetch_count=3,
+        prefetch_size=0,
+        global_=False,
+    )
+    close.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

@@ -4,15 +4,47 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Never
+from typing import Never, cast
 
 from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractQueueIterator,
+    AbstractRobustChannel,
+    AbstractRobustConnection,
     AbstractRobustQueue,
 )
 
 type TaskDeliveryHandler = Callable[[AbstractIncomingMessage], Awaitable[None]]
+
+
+async def open_consumer_channel(
+    connection: AbstractRobustConnection,
+    *,
+    prefetch_count: int,
+) -> AbstractRobustChannel:
+    """Open a recoverable channel with bounded per-consumer delivery credit."""
+
+    if prefetch_count < 1:
+        raise ValueError("prefetch_count must be at least 1")
+
+    channel = cast(
+        AbstractRobustChannel,
+        await connection.channel(
+            publisher_confirms=False,
+            on_return_raises=False,
+        ),
+    )
+    try:
+        await channel.set_qos(
+            prefetch_count=prefetch_count,
+            prefetch_size=0,
+            global_=False,
+        )
+    except BaseException:
+        await channel.close()
+        raise
+
+    return channel
 
 
 class TaskConsumerExitedError(RuntimeError):

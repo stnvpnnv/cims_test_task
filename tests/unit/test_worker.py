@@ -1,10 +1,12 @@
 """Tests for worker process resource composition."""
 
 import asyncio
-from contextlib import suppress
+import signal
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import timedelta
-from types import SimpleNamespace
+from types import FrameType, SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, Mock
 
@@ -340,3 +342,396 @@ async def test_worker_continues_cleanup_after_channel_close_failure(
     harness.close_channel.assert_awaited_once_with()
     harness.close_connection.assert_awaited_once_with(harness.connection)
     harness.dispose_engine.assert_awaited_once_with(harness.engine)
+
+
+@pytest.mark.asyncio
+async def test_signal_handlers_schedule_shutdown_and_restore_predecessors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Portable handlers keep signal callbacks small and leave no global state."""
+
+    stop_event = asyncio.Event()
+    event_loop = asyncio.get_running_loop()
+    call_soon_threadsafe = Mock(wraps=event_loop.call_soon_threadsafe)
+    monkeypatch.setattr(event_loop, "call_soon_threadsafe", call_soon_threadsafe)
+
+    previous_handlers: dict[signal.Signals, object] = {
+        signal.SIGINT: Mock(name="previous_sigint"),
+        signal.SIGTERM: Mock(name="previous_sigterm"),
+    }
+    active_handlers: dict[signal.Signals, object] = dict(previous_handlers)
+    replacements: list[tuple[signal.Signals, object]] = []
+
+    def replace_handler(
+        signal_number: signal.Signals,
+        handler: object,
+    ) -> object:
+        previous_handler = active_handlers[signal_number]
+        active_handlers[signal_number] = handler
+        replacements.append((signal_number, handler))
+        return previous_handler
+
+    monkeypatch.setattr(signal, "signal", replace_handler)
+
+    with worker_module._install_shutdown_signal_handlers(stop_event):
+        installed_sigint = active_handlers[signal.SIGINT]
+        installed_sigterm = active_handlers[signal.SIGTERM]
+        installed_handler = cast(
+            Callable[[int, FrameType | None], None],
+            installed_sigterm,
+        )
+        installed_handler(signal.SIGTERM, None)
+        call_soon_threadsafe.assert_called_once_with(stop_event.set)
+        assert not stop_event.is_set()
+        await asyncio.sleep(0)
+        assert stop_event.is_set()
+
+    assert replacements == [
+        (signal.SIGINT, installed_sigint),
+        (signal.SIGTERM, installed_sigterm),
+        (signal.SIGTERM, previous_handlers[signal.SIGTERM]),
+        (signal.SIGINT, previous_handlers[signal.SIGINT]),
+    ]
+    assert active_handlers == previous_handlers
+
+
+@pytest.mark.asyncio
+async def test_signal_handler_registration_rolls_back_partial_installation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later registration failure restores every handler already replaced."""
+
+    previous_sigint = Mock(name="previous_sigint")
+    expected_error = ValueError("signals require the main thread")
+    replacements: list[tuple[signal.Signals, object]] = []
+
+    def replace_handler(
+        signal_number: signal.Signals,
+        handler: object,
+    ) -> object:
+        replacements.append((signal_number, handler))
+        if signal_number == signal.SIGTERM:
+            raise expected_error
+        return previous_sigint
+
+    monkeypatch.setattr(signal, "signal", replace_handler)
+
+    with (
+        pytest.raises(ValueError, match="signals require the main thread") as error_info,
+        worker_module._install_shutdown_signal_handlers(asyncio.Event()),
+    ):
+        pytest.fail("registration failure must prevent the runtime from starting")
+
+    assert error_info.value is expected_error
+    assert replacements == [
+        (signal.SIGINT, replacements[0][1]),
+        (signal.SIGTERM, replacements[1][1]),
+        (signal.SIGINT, previous_sigint),
+    ]
+
+
+def _install_fake_signal_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+    captured_stop_events: list[asyncio.Event],
+    *,
+    request_shutdown: bool,
+) -> None:
+    @contextmanager
+    def install(stop_event: asyncio.Event) -> Iterator[None]:
+        captured_stop_events.append(stop_event)
+        if request_shutdown:
+            asyncio.get_running_loop().call_soon(stop_event.set)
+        yield
+
+    monkeypatch.setattr(
+        worker_module,
+        "_install_shutdown_signal_handlers",
+        install,
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_returns_when_worker_finishes_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finite worker process completes without waiting for a signal."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=False,
+    )
+    run_worker = AsyncMock()
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    settings = _settings()
+
+    await worker_module.supervise_worker(settings)
+
+    run_worker.assert_awaited_once_with(
+        settings,
+        stop_event=captured_stop_events[0],
+    )
+
+
+@pytest.mark.asyncio
+async def test_supervisor_preserves_worker_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup and runtime failures retain their original identity."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=False,
+    )
+    expected_error = RuntimeError("worker failed")
+    monkeypatch.setattr(
+        worker_module,
+        "run_worker",
+        AsyncMock(side_effect=expected_error),
+    )
+
+    with pytest.raises(RuntimeError) as error_info:
+        await worker_module.supervise_worker(_settings())
+
+    assert error_info.value is expected_error
+
+
+@pytest.mark.asyncio
+async def test_supervisor_allows_graceful_shutdown_after_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal lets the worker drain active deliveries and finish normally."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=True,
+    )
+    worker_observed_stop = asyncio.Event()
+    allow_worker_to_stop = asyncio.Event()
+
+    async def run_worker(
+        _settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event,
+    ) -> None:
+        await stop_event.wait()
+        worker_observed_stop.set()
+        await allow_worker_to_stop.wait()
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    supervisor_task = asyncio.create_task(
+        worker_module.supervise_worker(_settings()),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await worker_observed_stop.wait()
+        assert not supervisor_task.done()
+        allow_worker_to_stop.set()
+        await supervisor_task
+    finally:
+        if not supervisor_task.done():
+            supervisor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await supervisor_task
+
+    assert worker_observed_stop.is_set()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancels_worker_after_grace_period(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unresponsive worker is cancelled, reaped, and reported."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=True,
+    )
+    worker_cancelled = asyncio.Event()
+
+    async def run_worker(
+        _settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event,
+    ) -> None:
+        del stop_event
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_cancelled.set()
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    settings = _settings().model_copy(
+        update={"worker_shutdown_grace_seconds": 0.001},
+    )
+
+    with pytest.raises(
+        worker_module.WorkerShutdownTimeoutError,
+        match=r"0\.001 seconds",
+    ):
+        await worker_module.supervise_worker(settings)
+
+    assert worker_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancels_worker_when_it_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """External cancellation cannot orphan the owned worker task."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=False,
+    )
+    worker_started = asyncio.Event()
+    worker_cancelled = asyncio.Event()
+
+    async def run_worker(
+        _settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event,
+    ) -> None:
+        del stop_event
+        worker_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            worker_cancelled.set()
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    supervisor_task = asyncio.create_task(
+        worker_module.supervise_worker(_settings()),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await worker_started.wait()
+        supervisor_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await supervisor_task
+    finally:
+        if not supervisor_task.done():
+            supervisor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await supervisor_task
+
+    assert worker_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_observes_worker_failure_racing_with_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed child failure takes priority over supervisor cancellation."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=False,
+    )
+    worker_started = asyncio.Event()
+    shutdown_waiter_started = asyncio.Event()
+    finish_worker = asyncio.Event()
+    expected_error = RuntimeError("worker failed during cancellation")
+
+    async def run_worker(
+        _settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event,
+    ) -> None:
+        del stop_event
+        worker_started.set()
+        await finish_worker.wait()
+        raise expected_error
+
+    async def wait_for_shutdown(stop_event: asyncio.Event) -> None:
+        shutdown_waiter_started.set()
+        try:
+            await stop_event.wait()
+        finally:
+            finish_worker.set()
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    monkeypatch.setattr(worker_module, "_wait_for_shutdown", wait_for_shutdown)
+    supervisor_task = asyncio.create_task(
+        worker_module.supervise_worker(_settings()),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await worker_started.wait()
+            await shutdown_waiter_started.wait()
+        supervisor_task.cancel()
+        with pytest.raises(RuntimeError) as error_info:
+            await supervisor_task
+    finally:
+        if not supervisor_task.done():
+            supervisor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await supervisor_task
+
+    assert error_info.value is expected_error
+
+
+@pytest.mark.asyncio
+async def test_supervisor_surfaces_cleanup_failure_after_forced_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cleanup failures remain more important than the shutdown timeout."""
+
+    captured_stop_events: list[asyncio.Event] = []
+    _install_fake_signal_handlers(
+        monkeypatch,
+        captured_stop_events,
+        request_shutdown=True,
+    )
+    expected_error = RuntimeError("cleanup failed")
+
+    async def run_worker(
+        _settings: WorkerSettings,
+        *,
+        stop_event: asyncio.Event,
+    ) -> None:
+        del stop_event
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise expected_error
+
+    monkeypatch.setattr(worker_module, "run_worker", run_worker)
+    settings = _settings().model_copy(
+        update={"worker_shutdown_grace_seconds": 0.001},
+    )
+
+    with pytest.raises(RuntimeError) as error_info:
+        await worker_module.supervise_worker(settings)
+
+    assert error_info.value is expected_error
+
+
+def test_main_loads_worker_settings_and_runs_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The console entry point owns settings loading and the event loop."""
+
+    received_settings: list[WorkerSettings] = []
+
+    async def supervise_worker(settings: WorkerSettings) -> None:
+        received_settings.append(settings)
+
+    monkeypatch.setattr(worker_module, "supervise_worker", supervise_worker)
+
+    worker_module.main()
+
+    assert len(received_settings) == 1
+    assert isinstance(received_settings[0], WorkerSettings)

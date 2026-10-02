@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 cims-task-dispatcher = "cims_task_service.dispatcher:main"
+cims-task-worker = "cims_task_service.worker:main"
 
 [tool.poetry]
 packages = [{ include = "cims_task_service", from = "src" }]

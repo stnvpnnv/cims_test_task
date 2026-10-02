@@ -1,5 +1,20 @@
 # cims_test_task
 
+## Запуск
+
+Скопируйте `.env.example` в `.env`, задайте пароли PostgreSQL и RabbitMQ, затем
+заполните оба `CIMS_INTERNAL_*_URL`. Пароли внутри URL должны быть
+percent-encoded независимо от исходных значений.
+
+```shell
+docker compose up --build -d
+```
+
+Compose запускает API, dispatcher и worker; документация API по умолчанию
+доступна на `http://localhost:8000/docs`, интерфейс RabbitMQ — на
+`http://localhost:15672`. Состояние сервисов показывает `docker compose ps`.
+Остановка через `docker compose down` сохраняет данные в именованных volumes.
+
 ## Создание задачи
 
 `POST /api/v1/tasks` принимает `name`, `description` и приоритет `LOW`, `MEDIUM`

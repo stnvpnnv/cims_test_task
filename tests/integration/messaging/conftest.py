@@ -1,107 +1,16 @@
-"""Opt-in RabbitMQ fixtures with resources owned by each test."""
+"""RabbitMQ publisher routes with resources owned by each test."""
 
-import asyncio
-import os
 from collections.abc import AsyncIterator
-from urllib.parse import unquote_to_bytes, urlsplit
 from uuid import uuid4
 
-import pytest
 import pytest_asyncio
 from aio_pika import ExchangeType
-from aio_pika.abc import (
-    AbstractRobustChannel,
-    AbstractRobustConnection,
-    AbstractRobustExchange,
-    AbstractRobustQueue,
-)
+from aio_pika.abc import AbstractRobustChannel, AbstractRobustExchange, AbstractRobustQueue
 from aio_pika.exceptions import ChannelInvalidStateError, ChannelNotFoundEntity
-from pydantic import SecretStr
 
-from cims_task_service.config import Settings
-from cims_task_service.infrastructure.messaging.connection import (
-    close_rabbitmq_connection,
-    connect_rabbitmq,
-)
-from cims_task_service.infrastructure.messaging.publisher import open_publisher_channel
 from cims_task_service.infrastructure.messaging.topology import TASK_ROUTING_KEY
 
 _OPERATION_TIMEOUT_SECONDS = 5.0
-
-
-@pytest.fixture
-def rabbitmq_test_url() -> SecretStr:
-    """Require an explicit test vhost; never fall back to the application URL."""
-
-    raw_url = os.environ.get("CIMS_TEST_RABBITMQ_URL")
-    if raw_url is None:
-        pytest.skip("Set CIMS_TEST_RABBITMQ_URL to run RabbitMQ integration tests")
-
-    try:
-        parsed_url = urlsplit(raw_url)
-        host = parsed_url.hostname
-        username = parsed_url.username
-        password = parsed_url.password
-        port = parsed_url.port
-        vhost = unquote_to_bytes(parsed_url.path.removeprefix("/")).decode("utf-8")
-    except (UnicodeDecodeError, ValueError):
-        pytest.fail("CIMS_TEST_RABBITMQ_URL must be a valid AMQP URL", pytrace=False)
-
-    if (
-        parsed_url.scheme not in {"amqp", "amqps"}
-        or not host
-        or not username
-        or password is None
-        or port == 0
-        or parsed_url.query
-        or parsed_url.fragment
-        or not parsed_url.path.startswith("/")
-        or not vhost
-        or "/" in vhost
-        or "%" in vhost
-        or not vhost.endswith("_test")
-    ):
-        pytest.fail(
-            "CIMS_TEST_RABBITMQ_URL must use amqp or amqps, include credentials and "
-            "a host, use a non-zero port when specified, contain no query or fragment, "
-            "and target one plainly encoded vhost ending in _test",
-            pytrace=False,
-        )
-
-    return SecretStr(raw_url)
-
-
-@pytest_asyncio.fixture
-async def rabbitmq_connection(
-    rabbitmq_test_url: SecretStr,
-) -> AsyncIterator[AbstractRobustConnection]:
-    """Open and close a production-configured connection to the guarded vhost."""
-
-    settings = Settings(
-        rabbitmq_url=rabbitmq_test_url,
-        rabbitmq_connection_timeout_seconds=10.0,
-        rabbitmq_reconnect_interval_seconds=1.0,
-    )
-    connection = await connect_rabbitmq(settings)
-    try:
-        yield connection
-    finally:
-        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
-            await close_rabbitmq_connection(connection)
-
-
-@pytest_asyncio.fixture
-async def rabbitmq_publisher_channel(
-    rabbitmq_connection: AbstractRobustConnection,
-) -> AsyncIterator[AbstractRobustChannel]:
-    """Open the production publisher channel and bound its cleanup."""
-
-    channel = await open_publisher_channel(rabbitmq_connection)
-    try:
-        yield channel
-    finally:
-        async with asyncio.timeout(_OPERATION_TIMEOUT_SECONDS):
-            await channel.close()
 
 
 @pytest_asyncio.fixture

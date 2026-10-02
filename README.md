@@ -79,7 +79,7 @@ poetry run pytest tests/integration/database --no-cov
 соединения не используют схему `public`. При аварийном завершении процесса
 схема может остаться в тестовой БД.
 
-Тесты publisher требуют отдельного существующего RabbitMQ vhost с именем,
+Тесты publisher и consumer требуют отдельного существующего RabbitMQ vhost с именем,
 оканчивающимся на `_test`. Задайте `CIMS_TEST_RABBITMQ_URL` с явными учётными
 данными и без query или fragment; пользователю нужны права configure, write и read:
 
@@ -87,8 +87,15 @@ poetry run pytest tests/integration/database --no-cov
 poetry run pytest tests/integration/messaging --no-cov
 ```
 
-Каждый тест создаёт exchange и queue с уникальными именами и удаляет только свои
-ресурсы. Соответствующая группа интеграционных тестов пропускается с пояснением,
+Тесты создают exchange и queue с уникальными именами и удаляют только свои ресурсы.
+Сквозной сценарий требует обе тестовые переменные и проверяет API через ASGI transport,
+реальные PostgreSQL и RabbitMQ, dispatcher и worker до результата `COMPLETED`:
+
+```shell
+poetry run pytest tests/integration/test_task_pipeline.py --no-cov
+```
+
+Соответствующая группа интеграционных тестов пропускается с пояснением,
 если её `CIMS_TEST_*_URL` не задана; некорректный URL или недоступный сервис
 приводят к ошибке. Для полного прогона с покрытием задайте обе тестовые переменные
 и выполните `poetry run pytest`.

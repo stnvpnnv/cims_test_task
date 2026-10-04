@@ -27,6 +27,7 @@ type _AmqpUrl = Annotated[
 
 _AMQP_URL_ADAPTER: TypeAdapter[_AmqpUrl] = TypeAdapter(_AmqpUrl)
 MAX_EXECUTION_RETRY_DELAY_SECONDS: Final = 86_400.0
+MAX_PENDING_DELIVERY_TIMEOUT_SECONDS: Final = 604_800.0
 MAX_WORKER_CONCURRENCY: Final = 100
 
 
@@ -126,6 +127,28 @@ class DispatcherSettings(_ExecutionRetrySettings):
     dispatcher_shutdown_grace_seconds: PositiveFloat = 45.0
     execution_recovery_batch_size: Annotated[int, Field(ge=1, le=100)] = 10
     execution_recovery_poll_interval_seconds: PositiveFloat = 5.0
+    pending_delivery_timeout_seconds: PositiveFloat = 300.0
+
+    @field_validator("pending_delivery_timeout_seconds")
+    @classmethod
+    def require_representable_pending_delivery_timeout(cls, value: float) -> float:
+        """Keep delivery deadlines positive and within the supported PostgreSQL policy."""
+
+        try:
+            duration = timedelta(seconds=value)
+        except OverflowError as error:
+            message = "pending delivery timeout must fit within Python timedelta range"
+            raise ValueError(message) from error
+        if duration <= timedelta(0):
+            message = "pending delivery timeout must resolve to at least one microsecond"
+            raise ValueError(message)
+        if value > MAX_PENDING_DELIVERY_TIMEOUT_SECONDS:
+            message = (
+                "pending delivery timeout must be at most "
+                f"{MAX_PENDING_DELIVERY_TIMEOUT_SECONDS:g} seconds"
+            )
+            raise ValueError(message)
+        return value
 
     @model_validator(mode="after")
     def require_coherent_dispatcher_policy(self) -> Self:

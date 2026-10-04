@@ -124,8 +124,9 @@ async def run_execution_recovery_loop(
     *,
     stop_event: asyncio.Event,
     poll_interval_seconds: float,
+    recover_pending_once: Callable[[], Awaitable[int]] | None = None,
 ) -> None:
-    """Drain expired executions and wait interruptibly while recovery is idle."""
+    """Recover executions and pending deliveries serially on one pool connection."""
 
     if not isfinite(poll_interval_seconds) or poll_interval_seconds <= 0:
         raise ValueError("poll_interval_seconds must be finite and positive")
@@ -134,7 +135,12 @@ async def run_execution_recovery_loop(
         result = await recover_once()
         if stop_event.is_set():
             return
-        if result.locked > 0:
+        recovered_pending = 0
+        if recover_pending_once is not None:
+            recovered_pending = await recover_pending_once()
+        if stop_event.is_set():
+            return
+        if result.locked > 0 or recovered_pending > 0:
             continue
         await _wait_for_recovery_stop(
             stop_event,

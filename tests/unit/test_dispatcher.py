@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from cims_task_service import dispatcher as dispatcher_module
 from cims_task_service.application.execution_retry import ExecutionRetryDelayPolicy
+from cims_task_service.application.pending_delivery_recovery import PendingTaskDeliveryRecovery
 from cims_task_service.application.task_dispatcher import TaskOutboxDispatcher
 from cims_task_service.application.task_execution_recovery import TaskExecutionRecovery
 from cims_task_service.config import DispatcherSettings
@@ -42,6 +43,7 @@ class _RuntimeHarness:
     dispatcher: TaskOutboxDispatcher
     retry_policy: ExecutionRetryDelayPolicy
     recovery: TaskExecutionRecovery
+    pending_recovery: PendingTaskDeliveryRecovery
     create_engine: Mock
     create_sessions: Mock
     connect: AsyncMock
@@ -53,6 +55,7 @@ class _RuntimeHarness:
     dispatcher_factory: Mock
     retry_policy_factory: Mock
     recovery_factory: Mock
+    pending_recovery_factory: Mock
     run_loop: AsyncMock
     run_recovery_loop: AsyncMock
     dispose_engine: AsyncMock
@@ -95,6 +98,10 @@ def _install_runtime_harness(
         TaskExecutionRecovery,
         SimpleNamespace(recover_once=recover_once),
     )
+    pending_recovery = cast(
+        PendingTaskDeliveryRecovery,
+        SimpleNamespace(recover_once=AsyncMock()),
+    )
 
     create_engine = Mock(return_value=engine)
     create_sessions = Mock(return_value=session_factory)
@@ -108,6 +115,7 @@ def _install_runtime_harness(
     dispatcher_factory = Mock(return_value=dispatcher)
     retry_policy_factory = Mock(return_value=retry_policy)
     recovery_factory = Mock(return_value=recovery)
+    pending_recovery_factory = Mock(return_value=pending_recovery)
     run_loop = AsyncMock(side_effect=lambda *_args, **_kwargs: events.append("loop"))
     run_recovery_loop = AsyncMock(
         side_effect=lambda *_args, **_kwargs: events.append("recovery"),
@@ -124,6 +132,7 @@ def _install_runtime_harness(
         "dispatcher": dispatcher_factory,
         "retry_policy": retry_policy_factory,
         "recovery": recovery_factory,
+        "pending_recovery": pending_recovery_factory,
         "loop": run_loop,
         "recovery_loop": run_recovery_loop,
     }
@@ -146,6 +155,11 @@ def _install_runtime_harness(
     monkeypatch.setattr(dispatcher_module, "TaskOutboxDispatcher", dispatcher_factory)
     monkeypatch.setattr(dispatcher_module, "ExecutionRetryDelayPolicy", retry_policy_factory)
     monkeypatch.setattr(dispatcher_module, "TaskExecutionRecovery", recovery_factory)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "PendingTaskDeliveryRecovery",
+        pending_recovery_factory,
+    )
     monkeypatch.setattr(dispatcher_module, "run_dispatcher_loop", run_loop)
     monkeypatch.setattr(
         dispatcher_module,
@@ -164,6 +178,7 @@ def _install_runtime_harness(
         dispatcher=dispatcher,
         retry_policy=retry_policy,
         recovery=recovery,
+        pending_recovery=pending_recovery,
         create_engine=create_engine,
         create_sessions=create_sessions,
         connect=connect,
@@ -175,6 +190,7 @@ def _install_runtime_harness(
         dispatcher_factory=dispatcher_factory,
         retry_policy_factory=retry_policy_factory,
         recovery_factory=recovery_factory,
+        pending_recovery_factory=pending_recovery_factory,
         run_loop=run_loop,
         run_recovery_loop=run_recovery_loop,
         dispose_engine=dispose_engine,
@@ -194,6 +210,7 @@ def _settings() -> DispatcherSettings:
         dispatcher_retry_maximum_delay_seconds=8.0,
         execution_recovery_batch_size=7,
         execution_recovery_poll_interval_seconds=0.5,
+        pending_delivery_timeout_seconds=120.0,
         execution_retry_initial_delay_seconds=3.0,
         execution_retry_maximum_delay_seconds=12.0,
         rabbitmq_publish_timeout_seconds=3.0,
@@ -278,6 +295,11 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
         batch_size=7,
         retry_delay_for_attempt=harness.retry_policy,
     )
+    harness.pending_recovery_factory.assert_called_once_with(
+        harness.session_factory,
+        batch_size=7,
+        delivery_timeout=timedelta(seconds=120),
+    )
     harness.run_loop.assert_awaited_once_with(
         harness.dispatcher.dispatch_once,
         stop_event=stop_event,
@@ -285,6 +307,7 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
     )
     harness.run_recovery_loop.assert_awaited_once_with(
         harness.recovery.recover_once,
+        recover_pending_once=harness.pending_recovery.recover_once,
         stop_event=stop_event,
         poll_interval_seconds=0.5,
     )
@@ -312,6 +335,7 @@ async def test_dispatcher_builds_runtime_and_closes_resources_in_reverse_order(
         ("dispatcher", ["channel", "connection", "engine"]),
         ("retry_policy", ["channel", "connection", "engine"]),
         ("recovery", ["channel", "connection", "engine"]),
+        ("pending_recovery", ["channel", "connection", "engine"]),
         ("loop", ["recovery", "channel", "connection", "engine"]),
         ("recovery_loop", ["loop", "channel", "connection", "engine"]),
     ],

@@ -659,3 +659,220 @@ async def test_cancelling_active_recovery_propagates_into_the_current_pass() -> 
             await _cancel_and_wait(loop_task)
 
     assert recovery_cancelled.is_set()
+
+
+@pytest.mark.parametrize(
+    ("expired_count", "pending_count"),
+    [(0, 2), (1, 0), (1, 2)],
+)
+@pytest.mark.asyncio
+async def test_recovery_loop_drains_when_either_recovery_type_finds_work(
+    monkeypatch: pytest.MonkeyPatch,
+    expired_count: int,
+    pending_count: int,
+) -> None:
+    """One serialized loop drains both recovery sources before its idle wait."""
+
+    stop_event = asyncio.Event()
+    call_order: list[str] = []
+
+    def expired_pass() -> RecoveryBatchResult:
+        call_order.append("expired")
+        count = expired_count if call_order.count("expired") == 1 else 0
+        return RecoveryBatchResult(locked=count, retried=count, failed=0)
+
+    def pending_pass() -> int:
+        call_order.append("pending")
+        return pending_count if call_order.count("pending") == 1 else 0
+
+    def idle_wait(*_args: object, **_kwargs: object) -> None:
+        call_order.append("wait")
+        stop_event.set()
+
+    expired = AsyncMock(side_effect=expired_pass)
+    pending = AsyncMock(side_effect=pending_pass)
+    wait_for_stop = AsyncMock(side_effect=idle_wait)
+    monkeypatch.setattr(recovery_module, "_wait_for_recovery_stop", wait_for_stop)
+
+    await run_execution_recovery_loop(
+        expired,
+        recover_pending_once=pending,
+        stop_event=stop_event,
+        poll_interval_seconds=0.25,
+    )
+
+    assert call_order == ["expired", "pending", "expired", "pending", "wait"]
+    wait_for_stop.assert_awaited_once_with(stop_event, poll_interval_seconds=0.25)
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_skips_both_sources_when_already_stopped() -> None:
+    """A pre-existing shutdown prevents either recovery transaction."""
+
+    stop_event = asyncio.Event()
+    stop_event.set()
+    expired = AsyncMock()
+    pending = AsyncMock()
+
+    await run_execution_recovery_loop(
+        expired,
+        recover_pending_once=pending,
+        stop_event=stop_event,
+        poll_interval_seconds=1.0,
+    )
+
+    expired.assert_not_awaited()
+    pending.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_loop_checks_shutdown_between_the_two_transactions() -> None:
+    """A stop during expired-execution recovery skips pending-delivery recovery."""
+
+    stop_event = asyncio.Event()
+
+    async def expired_pass() -> RecoveryBatchResult:
+        stop_event.set()
+        return RecoveryBatchResult(locked=1, retried=1, failed=0)
+
+    pending = AsyncMock()
+
+    await run_execution_recovery_loop(
+        expired_pass,
+        recover_pending_once=pending,
+        stop_event=stop_event,
+        poll_interval_seconds=1.0,
+    )
+
+    pending.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_types_are_serial_and_active_pending_pass_finishes_on_stop() -> None:
+    """Only one reserved recovery connection is needed even while work is blocked."""
+
+    expired_started = asyncio.Event()
+    release_expired = asyncio.Event()
+    pending_started = asyncio.Event()
+    release_pending = asyncio.Event()
+    stop_event = asyncio.Event()
+    call_order: list[str] = []
+
+    async def expired_pass() -> RecoveryBatchResult:
+        call_order.append("expired started")
+        expired_started.set()
+        await release_expired.wait()
+        call_order.append("expired finished")
+        return RecoveryBatchResult(locked=0, retried=0, failed=0)
+
+    async def pending_pass() -> int:
+        call_order.append("pending started")
+        pending_started.set()
+        await release_pending.wait()
+        call_order.append("pending finished")
+        return 1
+
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            expired_pass,
+            recover_pending_once=pending_pass,
+            stop_event=stop_event,
+            poll_interval_seconds=1.0,
+        ),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await expired_started.wait()
+        assert not pending_started.is_set()
+        release_expired.set()
+        async with asyncio.timeout(1):
+            await pending_started.wait()
+        assert call_order == ["expired started", "expired finished", "pending started"]
+        stop_event.set()
+        assert not loop_task.done()
+        release_pending.set()
+        async with asyncio.timeout(1):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+    assert call_order == [
+        "expired started",
+        "expired finished",
+        "pending started",
+        "pending finished",
+    ]
+
+
+@pytest.mark.parametrize("failing_source", ["expired", "pending"])
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError, asyncio.CancelledError])
+@pytest.mark.asyncio
+async def test_combined_recovery_failure_propagates_without_repolling(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_source: str,
+    error_type: type[BaseException],
+) -> None:
+    """A recovery error or cancellation remains visible to process supervision."""
+
+    expected_error = error_type("recovery unavailable")
+    expired = AsyncMock(return_value=RecoveryBatchResult(locked=0, retried=0, failed=0))
+    pending = AsyncMock(return_value=0)
+    failing_callback = expired if failing_source == "expired" else pending
+    failing_callback.side_effect = expected_error
+    wait_for_stop = AsyncMock()
+    monkeypatch.setattr(recovery_module, "_wait_for_recovery_stop", wait_for_stop)
+
+    with pytest.raises(error_type) as error_info:
+        await run_execution_recovery_loop(
+            expired,
+            recover_pending_once=pending,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=1.0,
+        )
+
+    assert error_info.value is expected_error
+    expired.assert_awaited_once_with()
+    if failing_source == "expired":
+        pending.assert_not_awaited()
+    else:
+        pending.assert_awaited_once_with()
+    wait_for_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_forced_cancellation_reaches_active_pending_delivery_recovery() -> None:
+    """The combined loop cannot orphan its active pending-delivery transaction."""
+
+    pending_started = asyncio.Event()
+    pending_cancelled = asyncio.Event()
+    expired = AsyncMock(return_value=RecoveryBatchResult(locked=0, retried=0, failed=0))
+
+    async def pending_pass() -> int:
+        pending_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            pending_cancelled.set()
+        raise AssertionError("unreachable")
+
+    loop_task = asyncio.create_task(
+        run_execution_recovery_loop(
+            expired,
+            recover_pending_once=pending_pass,
+            stop_event=asyncio.Event(),
+            poll_interval_seconds=1.0,
+        ),
+    )
+    try:
+        async with asyncio.timeout(1):
+            await pending_started.wait()
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+    finally:
+        if not loop_task.done():
+            await _cancel_and_wait(loop_task)
+
+    expired.assert_awaited_once_with()
+    assert pending_cancelled.is_set()

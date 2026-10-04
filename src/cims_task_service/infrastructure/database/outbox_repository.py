@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cims_task_service.config import MAX_PENDING_DELIVERY_TIMEOUT_SECONDS
 from cims_task_service.domain.task import TaskStatus
 from cims_task_service.infrastructure.database.models import (
     JsonObject,
@@ -133,6 +134,68 @@ class OutboxRepository:
             for _task_id, _status, event_id in candidates
             if event_id in claimed_snapshots_by_id
         )
+
+    async def recover_pending_deliveries(
+        self,
+        *,
+        event_type: str,
+        batch_size: int,
+        delivery_timeout: timedelta,
+    ) -> int:
+        """Reopen aged confirmations while preserving the current execution envelope."""
+
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+        if delivery_timeout <= timedelta(0):
+            raise ValueError("delivery_timeout must be positive")
+        if delivery_timeout > timedelta(seconds=MAX_PENDING_DELIVERY_TIMEOUT_SECONDS):
+            raise ValueError("delivery_timeout must be at most 7 days")
+
+        current_delivery = (
+            OutboxEventModel.task_id == TaskModel.id,
+            OutboxEventModel.event_type == event_type,
+            OutboxEventModel.published_at.is_not(None),
+            OutboxEventModel.discarded_at.is_(None),
+            TaskModel.status == TaskStatus.PENDING,
+            OutboxEventModel.payload["task_id"].astext == cast(TaskModel.id, String),
+            OutboxEventModel.payload["dispatch_token"].astext
+            == cast(TaskModel.dispatch_token, String),
+        )
+        candidate_statement = (
+            select(OutboxEventModel.id)
+            .select_from(TaskModel)
+            .join(OutboxEventModel, OutboxEventModel.task_id == TaskModel.id)
+            .where(
+                *current_delivery,
+                OutboxEventModel.published_at <= func.statement_timestamp() - delivery_timeout,
+                OutboxEventModel.available_at <= func.statement_timestamp(),
+            )
+            .order_by(OutboxEventModel.published_at, OutboxEventModel.id)
+            .limit(batch_size)
+            .with_for_update(of=TaskModel, skip_locked=True)
+        )
+        candidate_ids = tuple((await self._session.scalars(candidate_statement)).all())
+        if not candidate_ids:
+            return 0
+
+        # Task-first locking agrees with claim/cancel. Recheck outbox eligibility
+        # after acquiring its row lock; publisher finalizers need no task lock.
+        recovery_statement = (
+            update(OutboxEventModel)
+            .where(
+                OutboxEventModel.id.in_(candidate_ids),
+                *current_delivery,
+                OutboxEventModel.published_at <= func.clock_timestamp() - delivery_timeout,
+                OutboxEventModel.available_at <= func.clock_timestamp(),
+            )
+            .values(
+                published_at=None,
+                available_at=func.clock_timestamp(),
+                last_error="PENDING_DELIVERY_TIMEOUT",
+            )
+            .returning(OutboxEventModel.id)
+        )
+        return len((await self._session.scalars(recovery_statement)).all())
 
     async def mark_published(
         self,

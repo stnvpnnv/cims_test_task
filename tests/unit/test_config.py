@@ -22,6 +22,7 @@ _DISPATCHER_DURATION_ENVIRONMENT_VARIABLES = (
     "CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS",
     "CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS",
     "CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS",
+    "CIMS_PENDING_DELIVERY_TIMEOUT_SECONDS",
 )
 
 _EXECUTION_RETRY_DURATION_ENVIRONMENT_VARIABLES = (
@@ -134,6 +135,7 @@ def test_dispatcher_settings_have_coherent_defaults() -> None:
     assert settings.dispatcher_shutdown_grace_seconds == 45.0
     assert settings.execution_recovery_batch_size == 10
     assert settings.execution_recovery_poll_interval_seconds == 5.0
+    assert settings.pending_delivery_timeout_seconds == 300.0
     assert settings.execution_retry_initial_delay_seconds == 5.0
     assert settings.execution_retry_maximum_delay_seconds == 300.0
 
@@ -152,6 +154,7 @@ def test_dispatcher_settings_load_environment_overrides(
     monkeypatch.setenv("CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS", "20")
     monkeypatch.setenv("CIMS_EXECUTION_RECOVERY_BATCH_SIZE", "8")
     monkeypatch.setenv("CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS", "4.5")
+    monkeypatch.setenv("CIMS_PENDING_DELIVERY_TIMEOUT_SECONDS", "600")
     monkeypatch.setenv("CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS", "7.5")
     monkeypatch.setenv("CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS", "240")
 
@@ -166,8 +169,36 @@ def test_dispatcher_settings_load_environment_overrides(
     assert settings.dispatcher_shutdown_grace_seconds == 20.0
     assert settings.execution_recovery_batch_size == 8
     assert settings.execution_recovery_poll_interval_seconds == 4.5
+    assert settings.pending_delivery_timeout_seconds == 600.0
     assert settings.execution_retry_initial_delay_seconds == 7.5
     assert settings.execution_retry_maximum_delay_seconds == 240.0
+
+
+@pytest.mark.parametrize("timeout", [0.000001, 1.0, 300.0, 3600.0, 604800.0])
+def test_pending_delivery_timeout_accepts_positive_representable_values(timeout: float) -> None:
+    settings = DispatcherSettings(pending_delivery_timeout_seconds=timeout)
+    assert settings.pending_delivery_timeout_seconds == timeout
+
+
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_pending_delivery_timeout_rejects_nonpositive_or_nonfinite_values(timeout: float) -> None:
+    with pytest.raises(ValidationError):
+        DispatcherSettings(pending_delivery_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize(
+    ("timeout", "message"),
+    [
+        (1e-10, "pending delivery timeout must resolve to at least one microsecond"),
+        (1e308, "pending delivery timeout must fit within Python timedelta range"),
+        (604800.000001, "pending delivery timeout must be at most 604800 seconds"),
+    ],
+)
+def test_pending_delivery_timeout_rejects_unrepresentable_values(
+    timeout: float, message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        DispatcherSettings(pending_delivery_timeout_seconds=timeout)
 
 
 def test_worker_settings_have_coherent_defaults() -> None:

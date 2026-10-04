@@ -10,6 +10,7 @@ from types import FrameType
 from typing import Final
 
 from cims_task_service.application.execution_retry import ExecutionRetryDelayPolicy
+from cims_task_service.application.pending_delivery_recovery import PendingTaskDeliveryRecovery
 from cims_task_service.application.task_dispatcher import (
     TaskOutboxDispatcher,
     run_dispatcher_loop,
@@ -103,6 +104,11 @@ async def run_dispatcher(
             batch_size=settings.execution_recovery_batch_size,
             retry_delay_for_attempt=execution_retry_delay,
         )
+        pending_recovery = PendingTaskDeliveryRecovery(
+            session_factory,
+            batch_size=settings.execution_recovery_batch_size,
+            delivery_timeout=timedelta(seconds=settings.pending_delivery_timeout_seconds),
+        )
 
         await _run_dispatcher_components(
             dispatcher_loop_factory=partial(
@@ -116,6 +122,7 @@ async def run_dispatcher(
                 execution_recovery.recover_once,
                 stop_event=stop_event,
                 poll_interval_seconds=settings.execution_recovery_poll_interval_seconds,
+                recover_pending_once=pending_recovery.recover_once,
             ),
             stop_event=stop_event,
         )

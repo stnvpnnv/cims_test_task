@@ -99,3 +99,14 @@ poetry run pytest tests/integration/test_task_pipeline.py --no-cov
 если её `CIMS_TEST_*_URL` не задана; некорректный URL или недоступный сервис
 приводят к ошибке. Для полного прогона с покрытием задайте обе тестовые переменные
 и выполните `poetry run pytest`.
+
+## CI
+
+GitHub Actions запускает проверки при push, pull request и вручную:
+
+- Ruff, форматирование, pre-commit, mypy и согласованность `poetry.lock`;
+- все тесты с отдельными PostgreSQL/RabbitMQ, без пропусков и с покрытием не ниже 90%;
+- сборку runtime Docker-образа после успешных проверок, без публикации и развёртывания.
+
+CI не использует локальный `.env` или рабочую БД. Отчёты JUnit и покрытия доступны
+в артефактах запуска в течение 7 дней. Workflow: [ci.yml](.github/workflows/ci.yml).

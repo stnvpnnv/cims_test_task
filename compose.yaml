@@ -1,0 +1,175 @@
+x-application: &application
+  image: cims-task-service:local
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+x-database-environment: &database-environment
+  CIMS_DATABASE_URL: "${CIMS_INTERNAL_DATABASE_URL:?Set CIMS_INTERNAL_DATABASE_URL in .env}"
+  CIMS_DATABASE_POOL_SIZE: "${CIMS_DATABASE_POOL_SIZE:-5}"
+  CIMS_DATABASE_MAX_OVERFLOW: "${CIMS_DATABASE_MAX_OVERFLOW:-10}"
+  CIMS_DATABASE_POOL_TIMEOUT_SECONDS: "${CIMS_DATABASE_POOL_TIMEOUT_SECONDS:-30}"
+  CIMS_DATABASE_POOL_RECYCLE_SECONDS: "${CIMS_DATABASE_POOL_RECYCLE_SECONDS:-1800}"
+
+x-rabbitmq-environment: &rabbitmq-environment
+  CIMS_RABBITMQ_URL: "${CIMS_INTERNAL_RABBITMQ_URL:?Set CIMS_INTERNAL_RABBITMQ_URL in .env}"
+  CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS: >-
+    ${CIMS_RABBITMQ_CONNECTION_TIMEOUT_SECONDS:-10}
+  CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS: >-
+    ${CIMS_RABBITMQ_RECONNECT_INTERVAL_SECONDS:-5}
+
+services:
+  postgres:
+    image: postgres:17.10-bookworm
+    environment:
+      POSTGRES_DB: ${CIMS_POSTGRES_DB:-cims}
+      POSTGRES_USER: ${CIMS_POSTGRES_USER:-cims}
+      POSTGRES_PASSWORD: ${CIMS_POSTGRES_PASSWORD:?Set CIMS_POSTGRES_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:${CIMS_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready --quiet --host=127.0.0.1
+          --username="$${POSTGRES_USER}" --dbname="$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  migrate:
+    <<: *application
+    build:
+      context: .
+      target: runtime
+    command: ["alembic", "-c", "pyproject.toml", "upgrade", "head"]
+    environment:
+      <<: *database-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    <<: *application
+    environment:
+      <<: *database-environment
+      CIMS_DEBUG: "${CIMS_DEBUG:-false}"
+      CIMS_TASK_MAX_ATTEMPTS: "${CIMS_TASK_MAX_ATTEMPTS:-3}"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${CIMS_API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+          "http://127.0.0.1:8000/health/live", timeout=2).read()
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  dispatcher:
+    <<: *application
+    command: ["cims-task-dispatcher"]
+    environment:
+      <<: [*database-environment, *rabbitmq-environment]
+      CIMS_DISPATCHER_BATCH_SIZE: "${CIMS_DISPATCHER_BATCH_SIZE:-10}"
+      CIMS_DISPATCHER_POLL_INTERVAL_SECONDS: >-
+        ${CIMS_DISPATCHER_POLL_INTERVAL_SECONDS:-0.5}
+      CIMS_DISPATCHER_LEASE_DURATION_SECONDS: >-
+        ${CIMS_DISPATCHER_LEASE_DURATION_SECONDS:-60}
+      CIMS_DISPATCHER_RETRY_INITIAL_DELAY_SECONDS: >-
+        ${CIMS_DISPATCHER_RETRY_INITIAL_DELAY_SECONDS:-1}
+      CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS: >-
+        ${CIMS_DISPATCHER_RETRY_MAXIMUM_DELAY_SECONDS:-60}
+      CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS: >-
+        ${CIMS_RABBITMQ_PUBLISH_TIMEOUT_SECONDS:-10}
+      CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS: >-
+        ${CIMS_DISPATCHER_SHUTDOWN_GRACE_SECONDS:-45}
+      CIMS_EXECUTION_RECOVERY_BATCH_SIZE: >-
+        ${CIMS_EXECUTION_RECOVERY_BATCH_SIZE:-10}
+      CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS: >-
+        ${CIMS_EXECUTION_RECOVERY_POLL_INTERVAL_SECONDS:-5}
+      CIMS_PENDING_DELIVERY_TIMEOUT_SECONDS: >-
+        ${CIMS_PENDING_DELIVERY_TIMEOUT_SECONDS:-300}
+      CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS: >-
+        ${CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS:-5}
+      CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS: >-
+        ${CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  worker:
+    <<: *application
+    command: ["cims-task-worker"]
+    environment:
+      <<: [*database-environment, *rabbitmq-environment]
+      CIMS_WORKER_CONCURRENCY: "${CIMS_WORKER_CONCURRENCY:-4}"
+      CIMS_WORKER_LEASE_DURATION_SECONDS: >-
+        ${CIMS_WORKER_LEASE_DURATION_SECONDS:-60}
+      CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS: >-
+        ${CIMS_WORKER_HEARTBEAT_INTERVAL_SECONDS:-15}
+      CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS: >-
+        ${CIMS_WORKER_PROCESSING_TIMEOUT_SECONDS:-300}
+      CIMS_WORKER_SHUTDOWN_GRACE_SECONDS: >-
+        ${CIMS_WORKER_SHUTDOWN_GRACE_SECONDS:-45}
+      CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS: >-
+        ${CIMS_EXECUTION_RETRY_INITIAL_DELAY_SECONDS:-5}
+      CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS: >-
+        ${CIMS_EXECUTION_RETRY_MAXIMUM_DELAY_SECONDS:-300}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+  rabbitmq:
+    image: rabbitmq:4.3.4-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_NODENAME: rabbit@rabbitmq
+      RABBITMQ_DEFAULT_USER: ${CIMS_RABBITMQ_USER:-cims}
+      RABBITMQ_DEFAULT_PASS: ${CIMS_RABBITMQ_PASSWORD:?Set CIMS_RABBITMQ_PASSWORD in .env}
+      RABBITMQ_DEFAULT_VHOST: ${CIMS_RABBITMQ_VHOST:-cims}
+    ports:
+      - "127.0.0.1:${CIMS_RABBITMQ_AMQP_PORT:-5672}:5672"
+      - "127.0.0.1:${CIMS_RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  postgres-data:
+  rabbitmq-data:

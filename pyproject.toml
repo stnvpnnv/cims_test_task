@@ -1,0 +1,145 @@
+[project]
+name = "cims-task-service"
+version = "0.1.0"
+description = "Fault-tolerant asynchronous task processing service"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "aio-pika>=10.0.1,<11.0.0",
+  "alembic>=1.18.5,<2.0.0",
+  "asyncpg>=0.31.0,<0.32.0",
+  "fastapi>=0.139.2,<0.140.0",
+  "pydantic>=2.13.4,<3.0.0",
+  "pydantic-settings>=2.14.2,<3.0.0",
+  "sqlalchemy[asyncio]>=2.0.51,<2.1.0",
+  "structlog>=26.1.0,<27.0.0",
+  "uvicorn[standard]>=0.51.0,<0.52.0",
+]
+
+[project.scripts]
+cims-task-dispatcher = "cims_task_service.dispatcher:main"
+cims-task-worker = "cims_task_service.worker:main"
+
+[tool.poetry]
+packages = [{ include = "cims_task_service", from = "src" }]
+
+[tool.poetry.group.dev.dependencies]
+commitizen = ">=4.16.5,<5.0.0"
+httpx2 = ">=2.9.1,<3.0.0"
+mypy = ">=2.3.0,<3.0.0"
+pip-audit = ">=2.10.1,<3.0.0"
+pre-commit = ">=4.6.0,<5.0.0"
+pytest = ">=9.1.1,<10.0.0"
+pytest-asyncio = ">=1.4.0,<2.0.0"
+pytest-cov = ">=7.1.0,<8.0.0"
+ruff = ">=0.15.22,<0.16.0"
+
+[tool.alembic]
+script_location = "%(here)s/migrations"
+prepend_sys_path = ["%(here)s/src"]
+output_encoding = "utf-8"
+
+[[tool.alembic.post_write_hooks]]
+name = "ruff-check"
+type = "module"
+module = "ruff"
+options = "check --fix REVISION_SCRIPT_FILENAME"
+
+[[tool.alembic.post_write_hooks]]
+name = "ruff-format"
+type = "module"
+module = "ruff"
+options = "format REVISION_SCRIPT_FILENAME"
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "ASYNC",
+  "B",
+  "C4",
+  "DTZ",
+  "E4",
+  "E7",
+  "E9",
+  "F",
+  "I",
+  "LOG",
+  "PIE",
+  "PT",
+  "RUF",
+  "S",
+  "SIM",
+  "UP",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cims_task_service"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]
+
+[tool.ruff.format]
+docstring-code-format = true
+indent-style = "space"
+line-ending = "lf"
+quote-style = "double"
+
+[tool.mypy]
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+pretty = true
+python_version = "3.12"
+show_error_codes = true
+strict = true
+warn_unreachable = true
+warn_unused_configs = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+addopts = [
+  "-ra",
+  "--strict-config",
+  "--strict-markers",
+  "--cov=cims_task_service",
+  "--cov-report=term-missing:skip-covered",
+  "--cov-report=xml:coverage.xml",
+]
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+asyncio_mode = "strict"
+filterwarnings = ["error"]
+markers = [
+  "integration: requires external services such as PostgreSQL or RabbitMQ",
+]
+minversion = "9.1"
+testpaths = ["tests"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["cims_task_service"]
+
+[tool.coverage.report]
+fail_under = 90
+precision = 2
+show_missing = true
+skip_covered = true
+
+[tool.commitizen]
+major_version_zero = true
+name = "cz_conventional_commits"
+tag_format = "v$version"
+version_provider = "pep621"
+
+[build-system]
+requires = ["poetry-core>=2.1.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

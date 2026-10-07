@@ -1,0 +1,55 @@
+* text=auto
+
+# Source and configuration files use LF on every platform
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+Makefile text eol=lf
+*.cfg text eol=lf
+*.conf text eol=lf
+*.css text eol=lf
+*.env text eol=lf
+*.example text eol=lf
+*.html text eol=lf
+*.ini text eol=lf
+*.js text eol=lf
+*.json text eol=lf
+*.lock text eol=lf
+*.mako text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.sh text eol=lf
+*.sql text eol=lf
+*.svg text eol=lf
+*.toml text eol=lf
+*.ts text eol=lf
+*.txt text eol=lf
+*.xml text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# Native Windows scripts retain CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets are never line-normalized
+*.7z binary
+*.avif binary
+*.db binary
+*.gif binary
+*.gz binary
+*.ico binary
+*.jpeg binary
+*.jpg binary
+*.pdf binary
+*.png binary
+*.tar binary
+*.webp binary
+*.whl binary
+*.woff binary
+*.woff2 binary
+*.zip binary
